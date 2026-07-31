@@ -78,13 +78,25 @@ try await auth.signOut()
 
 ## Testing
 
-Inject an implementation of `LuxTransport` to inspect or stub network requests, and an implementation of `LuxSessionStore` to keep tests independent of Keychain:
+Inject an implementation of `LuxTransport` to inspect or stub network requests,
+and an implementation of `LuxSessionStore` to keep tests independent of
+Keychain. For example, a test that does not need persistence can use this
+ephemeral store:
 
 ```swift
-let auth = LuxAuth(
-    client: client,
-    sessionStore: InMemorySessionStore()
-)
+private struct EphemeralSessionStore: LuxSessionStore {
+    func load() throws -> LuxStoredSession? { nil }
+    func save(_ storedSession: LuxStoredSession) throws {}
+    func clear() throws {}
+}
+
+@MainActor
+func makeTestAuth(client: LuxClient) -> LuxAuth {
+    LuxAuth(
+        client: client,
+        sessionStore: EphemeralSessionStore()
+    )
+}
 ```
 
 Never log access tokens, refresh tokens, Apple identity tokens, nonces, or authorization headers.
