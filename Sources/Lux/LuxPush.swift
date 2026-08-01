@@ -151,6 +151,7 @@ public final class LuxPush {
     @ObservationIgnored
     private nonisolated(unsafe) var authEventsTask: Task<Void, Never>?
     private var preSignOutHandlerID: UUID?
+    private var isSigningOut = false
 
     public convenience init(client: LuxClient, auth: LuxAuth) {
         self.init(
@@ -175,9 +176,33 @@ public final class LuxPush {
         self.system = system
         self.environmentProvider = environmentProvider
         self.registration = try? store.load()
-        self.preSignOutHandlerID = auth.addPreSignOutHandler { [weak self] session in
-            try await self?.unregisterForSignOut(accessToken: session.accessToken)
+        installAuthLifecycleSynchronization()
+    }
+
+    init(
+        client: LuxClient,
+        auth: LuxAuth,
+        store: any LuxPushRegistrationStore,
+        system: any LuxPushSystemProviding,
+        environmentProvider: any LuxAPNSEnvironmentProviding,
+        automaticallySynchronizesAuthEvents: Bool
+    ) {
+        self.client = client
+        self.auth = auth
+        self.store = store
+        self.system = system
+        self.environmentProvider = environmentProvider
+        self.registration = try? store.load()
+        if automaticallySynchronizesAuthEvents {
+            installAuthLifecycleSynchronization()
+        } else {
+            installPreSignOutHandler()
         }
+    }
+
+    private func installAuthLifecycleSynchronization() {
+        installPreSignOutHandler()
+        let auth = self.auth
         self.authEventsTask = Task { @MainActor [weak self, auth] in
             for await event in auth.events() {
                 guard let self else { return }
@@ -192,6 +217,12 @@ public final class LuxPush {
                     break
                 }
             }
+        }
+    }
+
+    private func installPreSignOutHandler() {
+        self.preSignOutHandlerID = auth.addPreSignOutHandler { [weak self] session in
+            try await self?.unregisterForSignOut(accessToken: session.accessToken)
         }
     }
 
@@ -243,18 +274,26 @@ public final class LuxPush {
             throw LuxError(code: "PUSH_EMPTY_TOKEN", message: "APNs returned an empty device token")
         }
         let existing = registration
-        let sameToken = existing?.token == token && existing?.appID == appID
+        let sameToken = existing?.token == token
+        var pendingRemovalTokens = existing?.pendingRemovalTokens ?? []
+        if let existing, !sameToken {
+            pendingRemovalTokens.append(existing.token)
+            pendingRemovalTokens = Array(Set(pendingRemovalTokens)).sorted()
+        }
         let pending = LuxStoredPushRegistration(
             token: token,
             environment: environment,
             appID: appID,
             deviceID: sameToken ? existing?.deviceID : nil,
-            userID: sameToken ? existing?.userID : nil
+            userID: sameToken ? existing?.userID : nil,
+            pendingRemovalTokens: pendingRemovalTokens
         )
         try store.save(pending)
         replaceRegistration(pending)
         let generation = registrationGeneration
-        if auth.isAuthenticated { try await synchronize(expectedGeneration: generation) }
+        if auth.isAuthenticated, !isSigningOut {
+            try await synchronize(expectedGeneration: generation)
+        }
     }
 
     /// Register the stored token to the current Lux user. This is idempotent and
@@ -264,6 +303,7 @@ public final class LuxPush {
     }
 
     private func synchronize(expectedGeneration: UInt64) async throws {
+        guard !isSigningOut else { throw CancellationError() }
         if let synchronizationTask,
            synchronizationTaskGeneration == expectedGeneration {
             return try await synchronizationTask.value
@@ -315,8 +355,14 @@ public final class LuxPush {
             environment: pending.environment,
             appID: pending.appID,
             deviceID: response.id,
-            userID: user.id
+            userID: user.id,
+            pendingRemovalTokens: []
         )
+        for token in pending.pendingRemovalTokens ?? [] {
+            try checkRegistration(expectedGeneration, matches: pending, userID: user.id)
+            try await deleteDevice(token: token, accessToken: accessToken)
+        }
+        try checkRegistration(expectedGeneration, matches: pending, userID: user.id)
         try store.save(registered)
         try checkRegistration(expectedGeneration, matches: pending, userID: user.id)
         replaceRegistration(registered)
@@ -335,28 +381,45 @@ public final class LuxPush {
     /// Unregister delivery but retain the APNs token so a future signed-in user
     /// can opt back in without waiting for Apple to rotate it.
     public func unregister() async throws {
-        guard let current = registration, let deviceID = current.deviceID else { return }
+        if let synchronizationTask {
+            _ = try? await synchronizationTask.value
+        }
+        guard let current = registration else { return }
         let generation = registrationGeneration
         let userID = auth.user?.id
         let token = try await auth.accessToken()
         try checkRegistration(generation, matches: current, userID: userID)
-        try await deleteDevice(id: deviceID, accessToken: token)
+        try await deleteDevice(token: current.token, accessToken: token)
+        for staleToken in current.pendingRemovalTokens ?? [] {
+            try checkRegistration(generation, matches: current, userID: userID)
+            try await deleteDevice(token: staleToken, accessToken: token)
+        }
         try checkRegistration(generation, matches: current, userID: userID)
         try markPending(expectedGeneration: generation)
     }
 
     /// Unregister and forget the local APNs token entirely.
     public func disable() async throws {
-        if registration?.deviceID != nil { try await unregister() }
+        if registration != nil, auth.isAuthenticated { try await unregister() }
         try store.clear()
         replaceRegistration(nil)
     }
 
     private func unregisterForSignOut(accessToken: String) async throws {
-        guard let current = registration, let deviceID = current.deviceID else { return }
+        isSigningOut = true
+        defer { isSigningOut = false }
+        if let synchronizationTask {
+            _ = try? await synchronizationTask.value
+        }
+        guard let current = registration else { return }
         let generation = registrationGeneration
+        var firstError: Error?
+        let tokens = Array(Set([current.token] + (current.pendingRemovalTokens ?? []))).sorted()
+        for token in tokens {
+            do { try await deleteDevice(token: token, accessToken: accessToken) }
+            catch { if firstError == nil { firstError = error } }
+        }
         do {
-            try await deleteDevice(id: deviceID, accessToken: accessToken)
             guard registrationGeneration == generation, registration == current else { return }
             try markPending(expectedGeneration: generation)
         } catch {
@@ -365,14 +428,16 @@ public final class LuxPush {
             if registrationGeneration == generation, registration == current {
                 try? markPending(expectedGeneration: generation)
             }
-            throw error
+            if firstError == nil { firstError = error }
         }
+        if let firstError { throw firstError }
     }
 
-    private func deleteDevice(id: String, accessToken: String) async throws {
+    private func deleteDevice(token: String, accessToken: String) async throws {
         let _: DeleteDeviceResponse = try await client.request(
             .delete,
-            path: "/push/devices/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id)",
+            path: "/push/devices",
+            body: DeleteDeviceBody(token: token),
             bearerToken: accessToken
         )
     }
@@ -385,7 +450,10 @@ public final class LuxPush {
         let pending = LuxStoredPushRegistration(
             token: current.token,
             environment: current.environment,
-            appID: current.appID
+            appID: current.appID,
+            deviceID: nil,
+            userID: nil,
+            pendingRemovalTokens: []
         )
         try store.save(pending)
         replaceRegistration(pending)
@@ -402,6 +470,7 @@ public final class LuxPush {
         userID: String?
     ) throws {
         guard
+            !isSigningOut,
             registrationGeneration == generation,
             registration == expected,
             auth.user?.id == userID
@@ -422,4 +491,5 @@ private struct RegisterDeviceBody: Encodable {
 
 private struct RegisterDeviceResponse: Decodable { let id: String }
 private struct DevicesResponse: Decodable { let devices: [LuxPushDevice] }
+private struct DeleteDeviceBody: Encodable { let token: String }
 private struct DeleteDeviceResponse: Decodable { let deleted: Bool }

@@ -26,11 +26,14 @@ struct LuxIntegrationTests {
         let session = try await auth.signInAnonymously()
         #expect(session.user.isAnonymous == true)
 
-        let token = "swift-integration-\(UUID().uuidString.lowercased())"
-        try await push.register(token: token, environment: .sandbox)
+        let prefix = "swift-integration-\(UUID().uuidString.lowercased())"
+        try await push.register(token: "\(prefix)-old", environment: .sandbox)
+        let supersededID = try #require(push.registration?.deviceID)
+        try await push.register(token: "\(prefix)-current", environment: .sandbox)
         let registeredID = try #require(push.registration?.deviceID)
         let devices = try await push.devices()
         #expect(devices.contains { $0.id == registeredID })
+        #expect(!devices.contains { $0.id == supersededID })
 
         try await push.unregister()
         #expect(push.registration?.deviceID == nil)

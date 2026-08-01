@@ -110,21 +110,243 @@ struct LuxPushTests {
         try await auth.signOut()
 
         let requests = await transport.requests
-        #expect(requests.map { $0.url!.path } == ["/push/devices/device-1", "/auth/v1/logout"])
+        #expect(requests.map { $0.url!.path } == ["/push/devices", "/auth/v1/logout"])
         #expect(requests.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == "Bearer access" })
+        let deleteBody = try #require(requests[0].httpBody)
+        let deleteJSON = try #require(JSONSerialization.jsonObject(with: deleteBody) as? [String: String])
+        #expect(deleteJSON["token"] == "token")
         #expect(push.registration?.token == "token")
         #expect(push.registration?.deviceID == nil)
         #expect(push.registration?.userID == nil)
+    }
+
+    @Test func tokenRotationRegistersNewTokenThenRemovesSupersededToken() async throws {
+        let transport = RecordingTransport { request, index in
+            if index == 1 {
+                return (
+                    Data(#"{"id":"new-device"}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            }
+            return (
+                Data(#"{"deleted":true}"#.utf8),
+                LuxClientTests.response(url: request.url!, status: 200)
+            )
+        }
+        let client = Self.client(transport)
+        let auth = LuxAuth(
+            client: client,
+            sessionStore: MemorySessionStore(LuxStoredSession(session: Self.session()))
+        )
+        _ = try await auth.restoreSession()
+        let store = MemoryPushStore(LuxStoredPushRegistration(
+            token: "old-token",
+            environment: .sandbox,
+            deviceID: "old-device",
+            userID: "user-1"
+        ))
+        let push = LuxPush(
+            client: client,
+            auth: auth,
+            store: store,
+            system: FixedPushSystem(),
+            environmentProvider: FixedEnvironmentProvider(environment: .sandbox)
+        )
+
+        try await push.register(token: "new-token", environment: .sandbox)
+
+        let requests = await transport.requests
+        #expect(requests.map { $0.httpMethod } == ["POST", "DELETE"])
+        #expect(requests.map { $0.url!.path } == ["/push/devices", "/push/devices"])
+        let register = try #require(
+            JSONSerialization.jsonObject(with: requests[0].httpBody!) as? [String: String]
+        )
+        let cleanup = try #require(
+            JSONSerialization.jsonObject(with: requests[1].httpBody!) as? [String: String]
+        )
+        #expect(register["token"] == "new-token")
+        #expect(cleanup["token"] == "old-token")
+        #expect(push.registration?.token == "new-token")
+        #expect(push.registration?.deviceID == "new-device")
+        #expect(push.registration?.pendingRemovalTokens == nil)
+    }
+
+    @Test func failedRotationCleanupIsPersistedAndRetried() async throws {
+        let transport = RecordingTransport { request, index in
+            if request.httpMethod == "POST" {
+                return (
+                    Data(#"{"id":"new-device"}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            }
+            return (
+                Data(index == 2 ? #"{"error":"temporary"}"#.utf8 : #"{"deleted":true}"#.utf8),
+                LuxClientTests.response(url: request.url!, status: index == 2 ? 503 : 200)
+            )
+        }
+        let client = Self.client(transport)
+        let auth = LuxAuth(
+            client: client,
+            sessionStore: MemorySessionStore(LuxStoredSession(session: Self.session()))
+        )
+        _ = try await auth.restoreSession()
+        let store = MemoryPushStore(LuxStoredPushRegistration(
+            token: "old-token",
+            environment: .sandbox,
+            deviceID: "old-device",
+            userID: "user-1"
+        ))
+        let push = LuxPush(
+            client: client,
+            auth: auth,
+            store: store,
+            system: FixedPushSystem(),
+            environmentProvider: FixedEnvironmentProvider(environment: .sandbox),
+            automaticallySynchronizesAuthEvents: false
+        )
+
+        do {
+            try await push.register(token: "new-token", environment: .sandbox)
+            Issue.record("Expected superseded-token cleanup to fail")
+        } catch is LuxAPIError {
+            #expect(store.stored?.token == "new-token")
+            #expect(store.stored?.deviceID == nil)
+            #expect(store.stored?.pendingRemovalTokens == ["old-token"])
+        }
+
+        try await push.synchronize()
+        #expect(store.stored?.deviceID == "new-device")
+        #expect(store.stored?.pendingRemovalTokens == nil)
+        let requests = await transport.requests
+        #expect(requests.map { $0.httpMethod } == ["POST", "DELETE", "POST", "DELETE"])
+    }
+
+    @Test func storedRegistrationDecodesBeforePendingCleanupFieldExisted() throws {
+        let stored = try JSONDecoder().decode(
+            LuxStoredPushRegistration.self,
+            from: Data(#"{"token":"legacy","environment":"sandbox","appID":"default"}"#.utf8)
+        )
+        #expect(stored.token == "legacy")
+        #expect(stored.pendingRemovalTokens == nil)
+    }
+
+    @Test func disableCleansPendingTokensBeforeForgettingLocalRegistration() async throws {
+        let transport = RecordingTransport { request, _ in
+            (
+                Data(#"{"deleted":true}"#.utf8),
+                LuxClientTests.response(url: request.url!, status: 200)
+            )
+        }
+        let client = Self.client(transport)
+        let auth = LuxAuth(
+            client: client,
+            sessionStore: MemorySessionStore(LuxStoredSession(session: Self.session()))
+        )
+        _ = try await auth.restoreSession()
+        let store = MemoryPushStore(LuxStoredPushRegistration(
+            token: "current-token",
+            environment: .sandbox,
+            appID: "default",
+            deviceID: nil,
+            userID: nil,
+            pendingRemovalTokens: ["old-token"]
+        ))
+        let push = LuxPush(
+            client: client,
+            auth: auth,
+            store: store,
+            system: FixedPushSystem(),
+            environmentProvider: FixedEnvironmentProvider(environment: .sandbox),
+            automaticallySynchronizesAuthEvents: false
+        )
+
+        try await push.disable()
+
+        let requests = await transport.requests
+        let deletedTokens = try requests.map { request in
+            let body = try #require(request.httpBody)
+            let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: String])
+            return json["token"]
+        }
+        #expect(deletedTokens == ["current-token", "old-token"])
+        #expect(store.stored == nil)
+        #expect(push.registration == nil)
+    }
+
+    @Test func signOutWaitsForInflightRegistrationThenDeletesByToken() async throws {
+        let gate = SuspensionGate()
+        let transport = RecordingTransport { request, index in
+            switch index {
+            case 1:
+                await gate.suspend()
+                return (
+                    Data(#"{"id":"raced-device"}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            case 2:
+                return (
+                    Data(#"{"deleted":true}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            default:
+                return (Data(), LuxClientTests.response(url: request.url!, status: 204))
+            }
+        }
+        let client = Self.client(transport)
+        let auth = LuxAuth(
+            client: client,
+            sessionStore: MemorySessionStore(LuxStoredSession(session: Self.session()))
+        )
+        _ = try await auth.restoreSession()
+        let push = LuxPush(
+            client: client,
+            auth: auth,
+            store: MemoryPushStore(LuxStoredPushRegistration(
+                token: "raced-token",
+                environment: .sandbox
+            )),
+            system: FixedPushSystem(),
+            environmentProvider: FixedEnvironmentProvider(environment: .sandbox),
+            automaticallySynchronizesAuthEvents: false
+        )
+        let synchronization = Task { try await push.synchronize() }
+        await gate.waitUntilStarted()
+
+        let signOut = Task { try await auth.signOut() }
+        await Task.yield()
+        #expect(!(await transport.requests.map { $0.url!.path }.contains("/auth/v1/logout")))
+        await gate.release()
+        try await signOut.value
+        _ = try? await synchronization.value
+
+        let requests = await transport.requests
+        #expect(requests.map { $0.url!.path } == [
+            "/push/devices",
+            "/push/devices",
+            "/auth/v1/logout",
+        ])
+        let cleanup = try #require(
+            JSONSerialization.jsonObject(with: requests[1].httpBody!) as? [String: String]
+        )
+        #expect(cleanup["token"] == "raced-token")
+        #expect(push.registration?.token == "raced-token")
+        #expect(push.registration?.deviceID == nil)
     }
 
     @Test func rotatedTokenCannotBeOverwrittenByStaleRegistrationResponse() async throws {
         let gate = SuspensionGate()
         let transport = RecordingTransport { request, _ in
             let body = request.httpBody.flatMap { String(data: $0, encoding: .utf8) }
-            if body?.contains(#""token":"old-token""#) == true {
+            if request.httpMethod == "POST", body?.contains(#""token":"old-token""#) == true {
                 await gate.suspend()
                 return (
                     Data(#"{"id":"old-device"}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            }
+            if request.httpMethod == "DELETE" {
+                return (
+                    Data(#"{"deleted":true}"#.utf8),
                     LuxClientTests.response(url: request.url!, status: 200)
                 )
             }
@@ -237,7 +459,7 @@ struct LuxPushTests {
     }
 
     private static func client(_ transport: any LuxTransport) -> LuxClient {
-        try! LuxClient(url: "https://example.com", publishableKey: "lux_pk_public", transport: transport)
+        try! LuxClient(url: "https://example.com", publishableKey: "lux_pub_public", transport: transport)
     }
 
     private static func session() -> LuxSession {

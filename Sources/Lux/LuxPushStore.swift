@@ -7,6 +7,9 @@ public struct LuxStoredPushRegistration: Codable, Sendable, Equatable {
     public let appID: String
     public let deviceID: String?
     public let userID: String?
+    // Tokens superseded before their server rows could be removed. Optional so
+    // registrations persisted by Lux 1.0/early 1.1 builds keep decoding.
+    let pendingRemovalTokens: [String]?
 
     public init(
         token: String,
@@ -20,6 +23,23 @@ public struct LuxStoredPushRegistration: Codable, Sendable, Equatable {
         self.appID = appID
         self.deviceID = deviceID
         self.userID = userID
+        self.pendingRemovalTokens = nil
+    }
+
+    init(
+        token: String,
+        environment: LuxAPNSEnvironment,
+        appID: String,
+        deviceID: String?,
+        userID: String?,
+        pendingRemovalTokens: [String]
+    ) {
+        self.token = token
+        self.environment = environment
+        self.appID = appID
+        self.deviceID = deviceID
+        self.userID = userID
+        self.pendingRemovalTokens = pendingRemovalTokens.isEmpty ? nil : pendingRemovalTokens
     }
 }
 
