@@ -142,13 +142,14 @@ struct LuxExpandedAuthTests {
         ])
     }
 
-    @Test func mobileClientRejectsSecretKeys() {
+    @Test(arguments: ["lux_sec_do-not-ship", "lux_sk_do-not-ship"])
+    func mobileClientRejectsSecretKeys(_ key: String) {
         #expect(throws: LuxSecurityError.secretKeyNotAllowed) {
-            try LuxClient(url: "https://example.com", publishableKey: "lux_sk_do-not-ship")
+            try LuxClient(url: "https://example.com", publishableKey: key)
         }
     }
 
     private static func client(_ transport: any LuxTransport) -> LuxClient {
-        try! LuxClient(url: "https://example.com", publishableKey: "lux_pk_public", transport: transport)
+        try! LuxClient(url: "https://example.com", publishableKey: "lux_pub_public", transport: transport)
     }
 }

@@ -40,7 +40,10 @@ public struct LuxClient: Sendable {
         guard scheme == "https" || localHost else {
             throw LuxConfigurationError.insecureRemoteURL
         }
-        guard !publishableKey.hasPrefix("lux_sk_") else {
+        guard
+            !publishableKey.hasPrefix("lux_sec_"),
+            !publishableKey.hasPrefix("lux_sk_")
+        else {
             throw LuxSecurityError.secretKeyNotAllowed
         }
         self.baseURL = base
