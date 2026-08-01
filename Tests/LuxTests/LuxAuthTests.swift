@@ -225,6 +225,38 @@ struct LuxAuthTests {
         }
     }
 
+    @Test func logoutInvalidatesCancellationResistantUserUpdate() async throws {
+        let gate = SuspensionGate()
+        let transport = RecordingTransport { request, _ in
+            if request.url?.path == "/auth/v1/user" {
+                await gate.suspend()
+                return (
+                    Data(#"{"user":{"id":"user-1","email":"stale@example.com"}}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            }
+            return (Data(), LuxClientTests.response(url: request.url!, status: 204))
+        }
+        let store = MemorySessionStore(LuxStoredSession(
+            session: Self.makeSession(expiresAt: Int.max)
+        ))
+        let auth = LuxAuth(client: Self.makeClient(transport: transport), sessionStore: store)
+        _ = try await auth.restoreSession()
+
+        let update = Task { try await auth.updateUser(email: "stale@example.com") }
+        await gate.waitUntilStarted()
+        try await auth.signOut()
+        await gate.release()
+
+        do {
+            _ = try await update.value
+            Issue.record("Expected stale user update to be cancelled")
+        } catch is CancellationError {
+            #expect(auth.session == nil)
+            #expect(store.stored == nil)
+        }
+    }
+
     @Test func logoutPostsBearerThenClearsLocalSession() async throws {
         let transport = RecordingTransport { request, _ in
             (Data(), LuxClientTests.response(url: request.url!, status: 204))
