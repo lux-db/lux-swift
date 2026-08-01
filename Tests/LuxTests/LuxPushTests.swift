@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@preconcurrency import UserNotifications
 @testable import Lux
 
 @MainActor
@@ -458,9 +459,85 @@ struct LuxPushTests {
         ])
     }
 
+    @Test func richImageHelperAttachesValidatedHTTPSImage() async throws {
+        let url = URL(string: "https://images.example.com/valid.png")!
+        ImageURLProtocol.install(
+            url: url,
+            status: 200,
+            contentType: "image/png",
+            data: Self.pixelPNG
+        )
+        let session = Self.imageSession()
+        defer { session.invalidateAndCancel() }
+        let content = UNMutableNotificationContent()
+        content.userInfo = ["image_url": url.absoluteString]
+
+        let enriched = await LuxPushAttachment.enrich(
+            content,
+            session: session,
+            maximumBytes: 1_024
+        )
+
+        #expect(enriched.attachments.count == 1)
+        #expect(ImageURLProtocol.requestCount(for: url) == 1)
+    }
+
+    @Test func richImageHelperRejectsInsecureNonImageAndOversizedContent() async {
+        let session = Self.imageSession()
+        defer { session.invalidateAndCancel() }
+
+        let insecureURL = URL(string: "http://images.example.com/insecure.png")!
+        ImageURLProtocol.install(
+            url: insecureURL,
+            status: 200,
+            contentType: "image/png",
+            data: Self.pixelPNG
+        )
+        let insecure = UNMutableNotificationContent()
+        insecure.userInfo = ["image_url": insecureURL.absoluteString]
+        #expect((await LuxPushAttachment.enrich(insecure, session: session)).attachments.isEmpty)
+        #expect(ImageURLProtocol.requestCount(for: insecureURL) == 0)
+
+        let textURL = URL(string: "https://images.example.com/not-image.png")!
+        ImageURLProtocol.install(
+            url: textURL,
+            status: 200,
+            contentType: "text/plain",
+            data: Data("not an image".utf8)
+        )
+        let text = UNMutableNotificationContent()
+        text.userInfo = ["image_url": textURL.absoluteString]
+        #expect((await LuxPushAttachment.enrich(text, session: session)).attachments.isEmpty)
+
+        let largeURL = URL(string: "https://images.example.com/large.png")!
+        ImageURLProtocol.install(
+            url: largeURL,
+            status: 200,
+            contentType: "image/png",
+            data: Self.pixelPNG
+        )
+        let large = UNMutableNotificationContent()
+        large.userInfo = ["image_url": largeURL.absoluteString]
+        #expect((await LuxPushAttachment.enrich(
+            large,
+            session: session,
+            maximumBytes: 8
+        )).attachments.isEmpty)
+    }
+
     private static func client(_ transport: any LuxTransport) -> LuxClient {
         try! LuxClient(url: "https://example.com", publishableKey: "lux_pub_public", transport: transport)
     }
+
+    private static func imageSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ImageURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+
+    private static let pixelPNG = Data(base64Encoded:
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII="
+    )!
 
     private static func session() -> LuxSession {
         LuxSession(
@@ -486,6 +563,61 @@ struct LuxPushTests {
             try await Task.sleep(for: .milliseconds(10))
         }
     }
+}
+
+final class ImageURLProtocol: URLProtocol, @unchecked Sendable {
+    private struct Stub: Sendable {
+        let status: Int
+        let contentType: String
+        let data: Data
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var stubs: [URL: Stub] = [:]
+    nonisolated(unsafe) private static var requestCounts: [URL: Int] = [:]
+
+    static func install(url: URL, status: Int, contentType: String, data: Data) {
+        lock.withLock {
+            stubs[url] = Stub(status: status, contentType: contentType, data: data)
+            requestCounts[url] = 0
+        }
+    }
+
+    static func requestCount(for url: URL) -> Int {
+        lock.withLock { requestCounts[url, default: 0] }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let stub = Self.lock.withLock { () -> Stub? in
+            Self.requestCounts[url, default: 0] += 1
+            return Self.stubs[url]
+        }
+        guard let stub else {
+            client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
+            return
+        }
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: stub.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": stub.contentType,
+                "Content-Length": String(stub.data.count),
+            ]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: stub.data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 final class MemoryPushStore: LuxPushRegistrationStore, @unchecked Sendable {

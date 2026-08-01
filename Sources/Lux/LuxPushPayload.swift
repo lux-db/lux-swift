@@ -138,9 +138,14 @@ public enum LuxPushAttachment {
                !(200..<300).contains(http.statusCode) {
                 return content
             }
+            guard response.mimeType?.lowercased().hasPrefix("image/") == true else {
+                return content
+            }
             if response.expectedContentLength > maximumBytes { return content }
             let values = try temporaryURL.resourceValues(forKeys: [.fileSizeKey])
-            if Int64(values.fileSize ?? 0) > maximumBytes { return content }
+            guard let fileSize = values.fileSize, Int64(fileSize) <= maximumBytes else {
+                return content
+            }
             let directory = FileManager.default.temporaryDirectory
                 .appending(path: "lux-push-\(UUID().uuidString)", directoryHint: .isDirectory)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
