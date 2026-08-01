@@ -56,14 +56,18 @@ public final class SystemLuxPushProvider: LuxPushSystemProviding {
     public init() {}
 
     public func authorizationStatus() async -> LuxPushAuthorizationStatus {
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        switch settings.authorizationStatus {
-        case .notDetermined: return .notDetermined
-        case .denied: return .denied
-        case .authorized: return .authorized
-        case .provisional: return .provisional
-        case .ephemeral: return .ephemeral
-        @unknown default: return .notDetermined
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                let status: LuxPushAuthorizationStatus = switch settings.authorizationStatus {
+                case .notDetermined: .notDetermined
+                case .denied: .denied
+                case .authorized: .authorized
+                case .provisional: .provisional
+                case .ephemeral: .ephemeral
+                @unknown default: .notDetermined
+                }
+                continuation.resume(returning: status)
+            }
         }
     }
 
