@@ -22,11 +22,75 @@ jobs:
       - name: Test
         run: swift test
       - name: Build iOS package
-        run: >-
-          xcodebuild build
-          -scheme Lux
-          -destination 'generic/platform=iOS Simulator'
+        run: |
+          xcodebuild build \
+          -scheme Lux \
+          -destination 'generic/platform=iOS Simulator' \
+          -derivedDataPath "$RUNNER_TEMP/lux-derived" \
           CODE_SIGNING_ALLOWED=NO
+      - name: Build documentation
+        run: |
+          xcodebuild docbuild \
+          -scheme Lux \
+          -destination 'generic/platform=iOS Simulator' \
+          -derivedDataPath "$RUNNER_TEMP/lux-docs" \
+          CODE_SIGNING_ALLOWED=NO
+      - name: Type-check sample app
+        run: |
+          xcrun --sdk iphonesimulator swiftc -typecheck \
+            -target arm64-apple-ios17.0-simulator \
+            -I "$RUNNER_TEMP/lux-derived/Build/Products/Debug-iphonesimulator" \
+            Examples/AuthPushExample/AuthPushExampleApp.swift \
+            Examples/AuthPushExample/AppDelegate.swift \
+            Examples/AuthPushExample/ContentView.swift
+          xcrun --sdk iphonesimulator swiftc -typecheck \
+            -target arm64-apple-ios17.0-simulator \
+            -I "$RUNNER_TEMP/lux-derived/Build/Products/Debug-iphonesimulator" \
+            Examples/AuthPushExample/NotificationService.swift
+      - uses: actions/checkout@v4
+        with:
+          repository: lux-db/lux
+          ref: v0.37.0
+          path: .integration/lux
+      - name: Build minimum supported Lux engine
+        working-directory: .integration/lux
+        run: cargo build --locked --bin lux
+      - name: Test Auth and Push against engine 0.37.0
+        env:
+          LUX_AUTH_ENABLED: "true"
+          LUX_AUTH_PUBLISHABLE_KEY: lux_pub_swift_release
+          LUX_AUTH_SECRET_KEY: lux_sec_swift_release
+          LUX_DATA_DIR: ${{ runner.temp }}/lux-swift-engine
+          LUX_HTTP_PORT: "5899"
+          LUX_PORT: "6399"
+          LUX_SAVE_INTERVAL: "0"
+        run: |
+          .integration/lux/target/debug/lux > "$RUNNER_TEMP/lux-engine.log" 2>&1 &
+          engine_pid=$!
+          trap 'kill "$engine_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..60}; do
+            if curl --fail --silent \
+              -X POST \
+              -H "apikey: $LUX_AUTH_PUBLISHABLE_KEY" \
+              http://127.0.0.1:5899/auth/v1/signin/apple/nonce \
+              >/dev/null; then
+              break
+            fi
+            if ! kill -0 "$engine_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/lux-engine.log"
+              exit 1
+            fi
+            if [[ "$attempt" == "60" ]]; then
+              cat "$RUNNER_TEMP/lux-engine.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          LUX_INTEGRATION_URL=http://127.0.0.1:5899 \
+          LUX_INTEGRATION_PUBLISHABLE_KEY="$LUX_AUTH_PUBLISHABLE_KEY" \
+          swift test --filter LuxIntegrationTests
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
