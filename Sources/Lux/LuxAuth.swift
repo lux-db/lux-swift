@@ -24,27 +24,23 @@ public struct SystemAppleCredentialStateProvider: LuxAppleCredentialStateProvidi
                     return
                 }
                 switch state {
-                case .authorized:
-                    continuation.resume(returning: .authorized)
-                case .revoked:
-                    continuation.resume(returning: .revoked)
-                case .transferred:
-                    continuation.resume(returning: .transferred)
-                case .notFound:
-                    continuation.resume(returning: .notFound)
-                @unknown default:
-                    continuation.resume(returning: .notFound)
+                case .authorized: continuation.resume(returning: .authorized)
+                case .revoked: continuation.resume(returning: .revoked)
+                case .transferred: continuation.resume(returning: .transferred)
+                case .notFound: continuation.resume(returning: .notFound)
+                @unknown default: continuation.resume(returning: .notFound)
                 }
             }
         }
     }
 }
 
-/// Observable auth store for SwiftUI with durable session lifecycle management.
+/// Observable, durable Lux authentication state for SwiftUI applications.
 @MainActor
 @Observable
 public final class LuxAuth {
     public private(set) var session: LuxSession?
+    public private(set) var isRestoring = false
     public var user: LuxUser? { session?.user }
     public var isAuthenticated: Bool { session != nil }
 
@@ -54,9 +50,12 @@ public final class LuxAuth {
     private let presentationAnchorProvider: () -> ASPresentationAnchor?
     private let now: @Sendable () -> Date
     private var appleCoordinator: AppleSignInCoordinator?
+    private var webCoordinator: OAuthWebCoordinator?
     private var appleUserIdentifier: String?
     private var refreshTask: Task<LuxSession, Error>?
     private var lifecycleGeneration: UInt64 = 0
+    private var eventContinuations: [UUID: AsyncStream<LuxAuthEvent>.Continuation] = [:]
+    private var preSignOutHandlers: [UUID: @MainActor (LuxSession) async throws -> Void] = [:]
 
     public convenience init(
         client: LuxClient,
@@ -83,14 +82,30 @@ public final class LuxAuth {
         self.now = now
     }
 
-    /// Restore a persisted session, checking Apple authorization when the session
-    /// originated from Sign in with Apple.
+    /// Auth lifecycle events. Each subscriber immediately receives the current
+    /// session as `initialSession` and then receives changes until cancelled.
+    public func events() -> AsyncStream<LuxAuthEvent> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            eventContinuations[id] = continuation
+            continuation.yield(.initialSession(session))
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.eventContinuations.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    /// Restore the Keychain session and verify native Apple authorization when
+    /// the session originated from Sign in with Apple.
     @discardableResult
     public func restoreSession() async throws -> LuxSession? {
         let generation = invalidateLifecycle()
+        isRestoring = true
+        defer { if lifecycleGeneration == generation { isRestoring = false } }
         try checkLifecycle(generation)
         guard let stored = try sessionStore.load() else {
             clearInMemorySession()
+            emit(.initialSession(nil))
             return nil
         }
 
@@ -99,6 +114,7 @@ public final class LuxAuth {
             try checkLifecycle(generation)
             guard state == .authorized else {
                 try clearLocalSession()
+                emit(.signedOut)
                 return nil
             }
         }
@@ -106,7 +122,65 @@ public final class LuxAuth {
         try checkLifecycle(generation)
         session = stored.session
         appleUserIdentifier = stored.appleUserIdentifier
+        emit(.initialSession(stored.session))
         return session
+    }
+
+    /// Create an email/password account. Projects requiring email confirmation
+    /// return a user with a nil session until the verification link is consumed.
+    @discardableResult
+    public func signUp(
+        email: String,
+        password: String,
+        metadata: [String: LuxJSONValue]? = nil,
+        emailRedirectTo: URL? = nil
+    ) async throws -> LuxAuthResult {
+        let generation = invalidateLifecycle()
+        let response: SignUpResponse = try await client.request(
+            .post,
+            path: "/auth/v1/signup",
+            body: SignUpBody(
+                email: email,
+                password: password,
+                data: metadata,
+                emailRedirectTo: emailRedirectTo?.absoluteString
+            )
+        )
+        try checkLifecycle(generation)
+        guard let newSession = response.session else {
+            return LuxAuthResult(session: nil, user: response.user)
+        }
+        let session = normalized(newSession)
+        try persistAndSetSession(session, appleUserIdentifier: nil, event: .signedIn(session))
+        return LuxAuthResult(session: session, user: session.user)
+    }
+
+    @discardableResult
+    public func signInWithPassword(email: String, password: String) async throws -> LuxSession {
+        let generation = invalidateLifecycle()
+        let session: LuxSession = try await client.request(
+            .post,
+            path: "/auth/v1/token",
+            body: PasswordSignInBody(email: email, password: password)
+        )
+        try checkLifecycle(generation)
+        let normalized = normalized(session)
+        try persistAndSetSession(normalized, appleUserIdentifier: nil, event: .signedIn(normalized))
+        return normalized
+    }
+
+    @discardableResult
+    public func signInAnonymously() async throws -> LuxSession {
+        let generation = invalidateLifecycle()
+        let session: LuxSession = try await client.request(
+            .post,
+            path: "/auth/v1/signin/anonymous",
+            body: EmptyBody()
+        )
+        try checkLifecycle(generation)
+        let normalized = normalized(session)
+        try persistAndSetSession(normalized, appleUserIdentifier: nil, event: .signedIn(normalized))
+        return normalized
     }
 
     /// Present the native Sign in with Apple sheet and exchange its identity token.
@@ -114,22 +188,20 @@ public final class LuxAuth {
     public func signInWithApple() async throws -> LuxSession {
         let generation = invalidateLifecycle()
         try checkLifecycle(generation)
-        let rawNonce = try await client.appleSignInNonce()
+        let nonce: AppleNonceResponse = try await client.request(
+            .post,
+            path: "/auth/v1/signin/apple/nonce",
+            body: EmptyBody()
+        )
         try checkLifecycle(generation)
 
         let request = ASAuthorizationAppleIDProvider().createRequest()
         request.requestedScopes = [.fullName, .email]
-        request.nonce = Nonce.sha256Hex(rawNonce)
+        request.nonce = Nonce.sha256Hex(nonce.nonce)
 
-        let coordinator = AppleSignInCoordinator(
-            presentationAnchorProvider: presentationAnchorProvider
-        )
+        let coordinator = AppleSignInCoordinator(presentationAnchorProvider: presentationAnchorProvider)
         appleCoordinator = coordinator
-        defer {
-            if lifecycleGeneration == generation {
-                appleCoordinator = nil
-            }
-        }
+        defer { if lifecycleGeneration == generation { appleCoordinator = nil } }
         let credential = try await coordinator.perform(request: request)
         try checkLifecycle(generation)
 
@@ -139,21 +211,143 @@ public final class LuxAuth {
         else {
             throw LuxError(code: "APPLE_NO_IDENTITY_TOKEN", message: "Apple returned no identity token")
         }
-
         let name = credential.fullName.flatMap { components -> String? in
-            let formatter = PersonNameComponentsFormatter()
-            let formatted = formatter.string(from: components)
+            let formatted = PersonNameComponentsFormatter().string(from: components)
             return formatted.isEmpty ? nil : formatted
         }
         let body = AppleSignInBody(
             idToken: idToken,
-            nonce: rawNonce,
+            nonce: nonce.nonce,
             user: name.map { AppleSignInBody.User(name: $0) }
         )
-        let newSession = normalized(try await client.signInWithApple(body))
+        let response: LuxSession = try await client.request(
+            .post,
+            path: "/auth/v1/signin/apple",
+            body: body
+        )
         try checkLifecycle(generation)
-        try persistAndSetSession(newSession, appleUserIdentifier: credential.user)
-        return newSession
+        let session = normalized(response)
+        try persistAndSetSession(session, appleUserIdentifier: credential.user, event: .signedIn(session))
+        return session
+    }
+
+    /// Run Google, GitHub, or Apple web OAuth using an ephemeral-capable native
+    /// authentication session and exchange the returned one-time code.
+    @discardableResult
+    public func signInWithOAuth(
+        _ provider: LuxOAuthProvider,
+        redirectURL: URL,
+        prefersEphemeralSession: Bool = false
+    ) async throws -> LuxSession {
+        guard let callbackScheme = redirectURL.scheme, !callbackScheme.isEmpty else {
+            throw LuxConfigurationError.invalidURL
+        }
+        let generation = invalidateLifecycle()
+        let pkce = try PKCE.generate()
+        let authorizationURL = try client.authorizationURL(
+            provider: provider,
+            redirectURL: redirectURL,
+            flow: .code,
+            codeChallenge: pkce.challenge
+        )
+        let coordinator = OAuthWebCoordinator(presentationAnchorProvider: presentationAnchorProvider)
+        webCoordinator = coordinator
+        defer { if lifecycleGeneration == generation { webCoordinator = nil } }
+        let callback = try await coordinator.perform(
+            authorizationURL: authorizationURL,
+            callbackScheme: callbackScheme,
+            prefersEphemeralSession: prefersEphemeralSession
+        )
+        try checkLifecycle(generation)
+        let components = URLComponents(url: callback, resolvingAgainstBaseURL: false)
+        if let error = components?.queryItems?.first(where: { $0.name == "error" })?.value {
+            throw LuxError(code: "OAUTH_ERROR", message: error)
+        }
+        guard let code = components?.queryItems?.first(where: { $0.name == "code" })?.value else {
+            throw LuxError(code: "OAUTH_MISSING_CODE", message: "OAuth callback did not contain an authorization code")
+        }
+        return try await exchangeCodeForSession(
+            code,
+            codeVerifier: pkce.verifier,
+            generation: generation
+        )
+    }
+
+    @discardableResult
+    public func exchangeCodeForSession(
+        _ code: String,
+        codeVerifier: String? = nil
+    ) async throws -> LuxSession {
+        let generation = invalidateLifecycle()
+        return try await exchangeCodeForSession(
+            code,
+            codeVerifier: codeVerifier,
+            generation: generation
+        )
+    }
+
+    public func resetPassword(for email: String, redirectTo: URL? = nil) async throws {
+        try await client.requestWithoutResponse(
+            .post,
+            path: "/auth/v1/recover",
+            body: PasswordRecoveryBody(email: email, redirectTo: redirectTo?.absoluteString)
+        )
+    }
+
+    @discardableResult
+    public func verifyOTP(tokenHash: String, type: LuxOTPType) async throws -> LuxSession {
+        let generation = invalidateLifecycle()
+        let response: LuxSession = try await client.request(
+            .post,
+            path: "/auth/v1/verify",
+            body: VerifyOTPBody(tokenHash: tokenHash, type: type.rawValue)
+        )
+        try checkLifecycle(generation)
+        let session = normalized(response)
+        try persistAndSetSession(session, appleUserIdentifier: nil, event: .signedIn(session))
+        return session
+    }
+
+    @discardableResult
+    public func updateUser(
+        email: String? = nil,
+        password: String? = nil,
+        metadata: [String: LuxJSONValue]? = nil
+    ) async throws -> LuxUser {
+        let generation = lifecycleGeneration
+        guard let expectedUserID = session?.user.id else {
+            throw LuxError(code: "NO_SESSION", message: "No authenticated session")
+        }
+        let token = try await accessToken()
+        try checkLifecycle(generation)
+        let response: UserResponse = try await client.request(
+            .put,
+            path: "/auth/v1/user",
+            body: UpdateUserBody(email: email, password: password, userMetadata: metadata),
+            bearerToken: token
+        )
+        try checkLifecycle(generation)
+        guard var current = session, current.user.id == expectedUserID else {
+            throw CancellationError()
+        }
+        current.user = response.user
+        try persistAndSetSession(
+            current,
+            appleUserIdentifier: appleUserIdentifier,
+            event: .userUpdated(response.user)
+        )
+        return response.user
+    }
+
+    @discardableResult
+    public func getUser() async throws -> LuxUser {
+        let token = try await accessToken()
+        let response: UserResponse = try await client.request(
+            .get,
+            path: "/auth/v1/user",
+            bearerToken: token
+        )
+        return response.user
     }
 
     /// Return a valid access token, sharing one refresh request across callers.
@@ -187,24 +381,28 @@ public final class LuxAuth {
         let refreshedAt = Int(now().timeIntervalSince1970)
         let task = Task { @MainActor [weak self] in
             try Task.checkCancellation()
-            var session = try await client.refreshSession(refreshToken: refreshToken)
+            var response: LuxSession = try await client.request(
+                .post,
+                path: "/auth/v1/token",
+                queryItems: [URLQueryItem(name: "grant_type", value: "refresh_token")],
+                body: RefreshTokenBody(refreshToken: refreshToken)
+            )
             try Task.checkCancellation()
             guard let self else { throw CancellationError() }
             try self.checkLifecycle(generation)
-            session.expiresAt = refreshedAt + session.expiresIn
+            response.expiresAt = refreshedAt + response.expiresIn
             try self.persistAndSetSession(
-                session,
-                appleUserIdentifier: appleUserIdentifier
+                response,
+                appleUserIdentifier: appleUserIdentifier,
+                event: .tokenRefreshed(response)
             )
-            return session
+            return response
         }
         refreshTask = task
 
         do {
             let refreshed = try await task.value
-            if lifecycleGeneration == generation {
-                refreshTask = nil
-            }
+            if lifecycleGeneration == generation { refreshTask = nil }
             try Task.checkCancellation()
             return refreshed
         } catch {
@@ -213,44 +411,74 @@ public final class LuxAuth {
                 if let apiError = error as? LuxAPIError, apiError.invalidatesRefreshToken {
                     _ = invalidateLifecycle()
                     try? clearLocalSession()
+                    emit(.signedOut)
                 }
             }
             throw error
         }
     }
 
-    /// Clear local state and revoke the captured server session.
+    /// Unregister dependent resources while the bearer token is valid, revoke
+    /// the server session, and always clear local credentials.
     public func signOut() async throws {
         let current = session
-        _ = invalidateLifecycle()
-        clearInMemorySession()
-
-        var storeError: Error?
-        do {
-            try sessionStore.clear()
-        } catch {
-            storeError = error
-        }
-
-        var remoteError: Error?
+        var firstError: Error?
         if let current {
-            do {
-                try Task.checkCancellation()
-                try await client.logout(
-                    accessToken: current.accessToken,
-                    refreshToken: current.refreshToken
-                )
-                try Task.checkCancellation()
-            } catch {
-                remoteError = error
+            for handler in preSignOutHandlers.values {
+                do { try await handler(current) }
+                catch { if firstError == nil { firstError = error } }
             }
         }
-        if let remoteError {
-            throw remoteError
+
+        _ = invalidateLifecycle()
+        clearInMemorySession()
+        do { try sessionStore.clear() }
+        catch { if firstError == nil { firstError = error } }
+
+        if let current {
+            do {
+                try await client.requestWithoutResponse(
+                    .post,
+                    path: "/auth/v1/logout",
+                    body: RefreshTokenBody(refreshToken: current.refreshToken),
+                    bearerToken: current.accessToken
+                )
+            } catch {
+                if firstError == nil { firstError = error }
+            }
         }
-        if let storeError {
-            throw storeError
-        }
+        emit(.signedOut)
+        if let firstError { throw firstError }
+    }
+
+    @discardableResult
+    func addPreSignOutHandler(
+        _ handler: @escaping @MainActor (LuxSession) async throws -> Void
+    ) -> UUID {
+        let id = UUID()
+        preSignOutHandlers[id] = handler
+        return id
+    }
+
+    func removePreSignOutHandler(_ id: UUID) {
+        preSignOutHandlers.removeValue(forKey: id)
+    }
+
+    private func exchangeCodeForSession(
+        _ code: String,
+        codeVerifier: String?,
+        generation: UInt64
+    ) async throws -> LuxSession {
+        let response: LuxSession = try await client.request(
+            .post,
+            path: "/auth/v1/token",
+            queryItems: [URLQueryItem(name: "grant_type", value: "authorization_code")],
+            body: AuthorizationCodeBody(code: code, codeVerifier: codeVerifier)
+        )
+        try checkLifecycle(generation)
+        let session = normalized(response)
+        try persistAndSetSession(session, appleUserIdentifier: nil, event: .signedIn(session))
+        return session
     }
 
     private func normalized(_ session: LuxSession) -> LuxSession {
@@ -259,7 +487,11 @@ public final class LuxAuth {
         return session
     }
 
-    private func persistAndSetSession(_ session: LuxSession, appleUserIdentifier: String?) throws {
+    private func persistAndSetSession(
+        _ session: LuxSession,
+        appleUserIdentifier: String?,
+        event: LuxAuthEvent
+    ) throws {
         do {
             try sessionStore.save(LuxStoredSession(
                 session: session,
@@ -268,15 +500,13 @@ public final class LuxAuth {
         } catch {
             _ = invalidateLifecycle()
             clearInMemorySession()
-            do {
-                try sessionStore.clear()
-            } catch {
-                throw LuxSessionPersistenceError.cleanupAfterSaveFailure
-            }
+            do { try sessionStore.clear() }
+            catch { throw LuxSessionPersistenceError.cleanupAfterSaveFailure }
             throw error
         }
         self.session = session
         self.appleUserIdentifier = appleUserIdentifier
+        emit(event)
     }
 
     private func clearLocalSession() throws {
@@ -289,6 +519,10 @@ public final class LuxAuth {
         appleUserIdentifier = nil
     }
 
+    private func emit(_ event: LuxAuthEvent) {
+        for continuation in eventContinuations.values { continuation.yield(event) }
+    }
+
     @discardableResult
     private func invalidateLifecycle() -> UInt64 {
         lifecycleGeneration &+= 1
@@ -296,111 +530,17 @@ public final class LuxAuth {
         refreshTask = nil
         appleCoordinator?.cancel()
         appleCoordinator = nil
+        webCoordinator?.cancel()
+        webCoordinator = nil
         return lifecycleGeneration
     }
 
     private func checkLifecycle(_ generation: UInt64) throws {
         try Task.checkCancellation()
-        guard lifecycleGeneration == generation else {
-            throw CancellationError()
-        }
+        guard lifecycleGeneration == generation else { throw CancellationError() }
     }
 }
 
 public enum LuxSessionPersistenceError: Error, Sendable, Equatable {
     case cleanupAfterSaveFailure
 }
-
-/// Bridges ASAuthorizationController delegate callbacks into async/await.
-@MainActor
-private final class AppleSignInCoordinator: NSObject,
-    ASAuthorizationControllerDelegate,
-    ASAuthorizationControllerPresentationContextProviding
-{
-    private let presentationAnchorProvider: () -> ASPresentationAnchor?
-    private var continuation: CheckedContinuation<ASAuthorizationAppleIDCredential, Error>?
-    private var controller: ASAuthorizationController?
-    private var presentationAnchor: ASPresentationAnchor?
-
-    init(presentationAnchorProvider: @escaping () -> ASPresentationAnchor?) {
-        self.presentationAnchorProvider = presentationAnchorProvider
-    }
-
-    func perform(request: ASAuthorizationAppleIDRequest) async throws -> ASAuthorizationAppleIDCredential {
-        guard let anchor = presentationAnchorProvider() ?? Self.defaultPresentationAnchor() else {
-            throw LuxError(
-                code: "APPLE_NO_PRESENTATION_ANCHOR",
-                message: "Sign in with Apple requires a visible presentation window"
-            )
-        }
-        presentationAnchor = anchor
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                self.continuation = continuation
-                let controller = ASAuthorizationController(authorizationRequests: [request])
-                self.controller = controller
-                controller.delegate = self
-                controller.presentationContextProvider = self
-                controller.performRequests()
-            }
-        } onCancel: {
-            Task { @MainActor in self.cancel() }
-        }
-    }
-
-    func authorizationController(
-        controller: ASAuthorizationController,
-        didCompleteWithAuthorization authorization: ASAuthorization
-    ) {
-        guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential else {
-            finish(.failure(LuxError(
-                code: "APPLE_WRONG_CREDENTIAL",
-                message: "Unexpected Apple credential type"
-            )))
-            return
-        }
-        finish(.success(credential))
-    }
-
-    func authorizationController(
-        controller: ASAuthorizationController,
-        didCompleteWithError error: Error
-    ) {
-        finish(.failure(error))
-    }
-
-    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
-        presentationAnchor!
-    }
-
-    private static func defaultPresentationAnchor() -> ASPresentationAnchor? {
-        #if os(iOS)
-        let scenes = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .filter { $0.activationState == .foregroundActive }
-        return scenes.flatMap(\.windows).first { $0.isKeyWindow }
-        #else
-        return NSApplication.shared.keyWindow
-            ?? NSApplication.shared.windows.first { $0.isVisible }
-        #endif
-    }
-
-    fileprivate func cancel() {
-        controller?.cancel()
-        finish(.failure(CancellationError()))
-    }
-
-    private func finish(_ result: Result<ASAuthorizationAppleIDCredential, Error>) {
-        guard let continuation else { return }
-        self.continuation = nil
-        controller = nil
-        presentationAnchor = nil
-        continuation.resume(with: result)
-    }
-}
-
-#if os(iOS)
-import UIKit
-#elseif os(macOS)
-import AppKit
-#endif

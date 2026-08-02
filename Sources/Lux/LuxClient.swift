@@ -1,6 +1,10 @@
 import Foundation
 
-/// A Lux project client: the base URL of a project's API and its publishable key.
+/// Low-level HTTP client shared by Lux's client-safe namespaces.
+///
+/// Applications normally create a ``LuxProject``. `LuxClient` stays public for
+/// dependency injection and for existing 1.0 applications that construct
+/// ``LuxAuth`` directly.
 public struct LuxClient: Sendable {
     public let baseURL: URL
     public let publishableKey: String
@@ -36,6 +40,12 @@ public struct LuxClient: Sendable {
         guard scheme == "https" || localHost else {
             throw LuxConfigurationError.insecureRemoteURL
         }
+        guard
+            !publishableKey.hasPrefix("lux_sec_"),
+            !publishableKey.hasPrefix("lux_sk_")
+        else {
+            throw LuxSecurityError.secretKeyNotAllowed
+        }
         self.baseURL = base
         self.publishableKey = publishableKey
         self.transport = transport
@@ -49,12 +59,15 @@ public struct LuxClient: Sendable {
         )
     }
 
+    // MARK: 1.0 auth transport compatibility
+
     func signInWithApple(_ body: AppleSignInBody) async throws -> LuxSession {
-        try await postJSON(path: "/auth/v1/signin/apple", body: body)
+        try await request(.post, path: "/auth/v1/signin/apple", body: body)
     }
 
     func appleSignInNonce() async throws -> String {
-        let response: AppleNonceResponse = try await postJSON(
+        let response: AppleNonceResponse = try await request(
+            .post,
             path: "/auth/v1/signin/apple/nonce",
             body: EmptyBody()
         )
@@ -62,7 +75,8 @@ public struct LuxClient: Sendable {
     }
 
     func refreshSession(refreshToken: String) async throws -> LuxSession {
-        try await postJSON(
+        try await request(
+            .post,
             path: "/auth/v1/token",
             queryItems: [URLQueryItem(name: "grant_type", value: "refresh_token")],
             body: RefreshTokenBody(refreshToken: refreshToken)
@@ -70,24 +84,133 @@ public struct LuxClient: Sendable {
     }
 
     func logout(accessToken: String, refreshToken: String) async throws {
-        try await postJSONWithoutResponse(
+        try await requestWithoutResponse(
+            .post,
             path: "/auth/v1/logout",
             body: RefreshTokenBody(refreshToken: refreshToken),
             bearerToken: accessToken
         )
     }
 
-    private func postJSON<Body: Encodable, Response: Decodable>(
+    func request<Response: Decodable>(
+        _ method: LuxHTTPMethod,
         path: String,
         queryItems: [URLQueryItem] = [],
-        body: Body
+        bearerToken: String? = nil,
+        as _: Response.Type = Response.self
     ) async throws -> Response {
-        var request = makeRequest(path: path, queryItems: queryItems)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(body)
-        let data = try await send(request)
+        try await requestData(
+            method,
+            path: path,
+            queryItems: queryItems,
+            bearerToken: bearerToken,
+            body: nil,
+            contentType: nil
+        )
+    }
 
+    func request<Body: Encodable, Response: Decodable>(
+        _ method: LuxHTTPMethod,
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        body: Body,
+        bearerToken: String? = nil,
+        as _: Response.Type = Response.self
+    ) async throws -> Response {
+        let encoded: Data
+        do {
+            encoded = try JSONEncoder().encode(body)
+        } catch {
+            throw LuxEncodingError.encoding
+        }
+        return try await requestData(
+            method,
+            path: path,
+            queryItems: queryItems,
+            bearerToken: bearerToken,
+            body: encoded,
+            contentType: "application/json"
+        )
+    }
+
+    func requestWithoutResponse<Body: Encodable>(
+        _ method: LuxHTTPMethod,
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        body: Body,
+        bearerToken: String? = nil
+    ) async throws {
+        let encoded: Data
+        do {
+            encoded = try JSONEncoder().encode(body)
+        } catch {
+            throw LuxEncodingError.encoding
+        }
+        _ = try await send(makeRequest(
+            method,
+            path: path,
+            queryItems: queryItems,
+            bearerToken: bearerToken,
+            body: encoded,
+            contentType: "application/json"
+        ))
+    }
+
+    func requestWithoutResponse(
+        _ method: LuxHTTPMethod,
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        bearerToken: String? = nil
+    ) async throws {
+        _ = try await send(makeRequest(
+            method,
+            path: path,
+            queryItems: queryItems,
+            bearerToken: bearerToken,
+            body: nil,
+            contentType: nil
+        ))
+    }
+
+    func authorizationURL(
+        provider: LuxOAuthProvider,
+        redirectURL: URL,
+        flow: LuxOAuthFlow = .code,
+        codeChallenge: String? = nil
+    ) throws -> URL {
+        var components = URLComponents(
+            url: baseURL.appending(path: "auth/v1/authorize"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "provider", value: provider.rawValue),
+            URLQueryItem(name: "redirect_to", value: redirectURL.absoluteString),
+            URLQueryItem(name: "flow", value: flow.rawValue),
+        ]
+        if let codeChallenge {
+            components.queryItems?.append(URLQueryItem(name: "code_challenge", value: codeChallenge))
+            components.queryItems?.append(URLQueryItem(name: "code_challenge_method", value: "S256"))
+        }
+        guard let url = components.url else { throw LuxConfigurationError.invalidURL }
+        return url
+    }
+
+    private func requestData<Response: Decodable>(
+        _ method: LuxHTTPMethod,
+        path: String,
+        queryItems: [URLQueryItem],
+        bearerToken: String?,
+        body: Data?,
+        contentType: String?
+    ) async throws -> Response {
+        let data = try await send(makeRequest(
+            method,
+            path: path,
+            queryItems: queryItems,
+            bearerToken: bearerToken,
+            body: body,
+            contentType: contentType
+        ))
         do {
             return try JSONDecoder().decode(Response.self, from: data)
         } catch {
@@ -95,29 +218,31 @@ public struct LuxClient: Sendable {
         }
     }
 
-    private func postJSONWithoutResponse<Body: Encodable>(
+    private func makeRequest(
+        _ method: LuxHTTPMethod,
         path: String,
-        body: Body,
-        bearerToken: String? = nil
-    ) async throws {
-        var request = makeRequest(path: path)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let bearerToken {
-            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-        }
-        request.httpBody = try JSONEncoder().encode(body)
-        _ = try await send(request)
-    }
-
-    private func makeRequest(path: String, queryItems: [URLQueryItem] = []) -> URLRequest {
-        let url = baseURL.appending(path: path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        queryItems: [URLQueryItem],
+        bearerToken: String?,
+        body: Data?,
+        contentType: String?
+    ) -> URLRequest {
+        let relativePath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let url = baseURL.appending(path: relativePath)
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
         components.queryItems = queryItems.isEmpty ? nil : queryItems
 
         var request = URLRequest(url: components.url!)
+        request.httpMethod = method.rawValue
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(publishableKey, forHTTPHeaderField: "apikey")
+        request.setValue("lux-swift/1.1", forHTTPHeaderField: "X-Lux-Client")
+        if let bearerToken {
+            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        }
+        if let contentType {
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        }
+        request.httpBody = body
         return request
     }
 
@@ -138,12 +263,27 @@ public struct LuxClient: Sendable {
     }
 }
 
+enum LuxHTTPMethod: String, Sendable {
+    case get = "GET"
+    case post = "POST"
+    case put = "PUT"
+    case delete = "DELETE"
+}
+
 public enum LuxConfigurationError: Error, Sendable, Equatable {
     case invalidURL
     case unsupportedScheme
     case insecureRemoteURL
     case userInfoNotAllowed
     case queryOrFragmentNotAllowed
+}
+
+public enum LuxSecurityError: Error, Sendable, Equatable {
+    case secretKeyNotAllowed
+}
+
+public enum LuxEncodingError: Error, Sendable, Equatable {
+    case encoding
 }
 
 public struct LuxError: Error, Sendable, Equatable {
@@ -203,6 +343,7 @@ private struct LuxErrorBody: Decodable {
         guard let error, !error.contains(where: \.isWhitespace) else { return nil }
         return error
     }
+
     var resolvedMessage: String? { message ?? errorDescription ?? error }
 
     enum CodingKeys: String, CodingKey {
@@ -210,88 +351,5 @@ private struct LuxErrorBody: Decodable {
         case errorDescription = "error_description"
         case code
         case message
-    }
-}
-
-struct AppleSignInBody: Encodable {
-    let idToken: String
-    let nonce: String
-    let user: User?
-
-    struct User: Encodable {
-        let name: String
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case idToken = "id_token"
-        case nonce
-        case user
-    }
-}
-
-private struct AppleNonceResponse: Decodable {
-    let nonce: String
-}
-
-private struct EmptyBody: Encodable {}
-
-private struct RefreshTokenBody: Encodable {
-    let refreshToken: String
-
-    enum CodingKeys: String, CodingKey {
-        case refreshToken = "refresh_token"
-    }
-}
-
-/// A Lux auth session. Timestamps are epoch seconds.
-public struct LuxSession: Codable, Sendable, Equatable {
-    public let accessToken: String
-    public let tokenType: String
-    public let expiresIn: Int
-    public let refreshToken: String
-    public let user: LuxUser
-    public var expiresAt: Int?
-
-    public init(
-        accessToken: String,
-        tokenType: String = "bearer",
-        expiresIn: Int,
-        refreshToken: String,
-        user: LuxUser,
-        expiresAt: Int? = nil
-    ) {
-        self.accessToken = accessToken
-        self.tokenType = tokenType
-        self.expiresIn = expiresIn
-        self.refreshToken = refreshToken
-        self.user = user
-        self.expiresAt = expiresAt
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case accessToken = "access_token"
-        case tokenType = "token_type"
-        case expiresIn = "expires_in"
-        case refreshToken = "refresh_token"
-        case user
-        case expiresAt = "expires_at"
-    }
-}
-
-public struct LuxUser: Codable, Sendable, Equatable, Identifiable {
-    public let id: String
-    public var email: String?
-    public var isAnonymous: Bool?
-
-    public init(id: String, email: String? = nil, isAnonymous: Bool? = nil) {
-        self.id = id
-        self.email = email
-        self.isAnonymous = isAnonymous
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case email
-        case isAnonymous = "is_anonymous"
     }
 }
