@@ -14,8 +14,12 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Test
         run: swift test
+      - name: Preserve the 1.0 public API
+        run: swift package diagnose-api-breaking-changes 1.0.0
 
   ios:
     runs-on: macos-15

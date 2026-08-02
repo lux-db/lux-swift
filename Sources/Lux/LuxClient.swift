@@ -15,6 +15,20 @@ public struct LuxClient: Sendable {
         publishableKey: String,
         transport: any LuxTransport = URLSessionLuxTransport()
     ) throws {
+        try self.init(
+            url: url,
+            publishableKey: publishableKey,
+            networkPolicy: .secure,
+            transport: transport
+        )
+    }
+
+    public init(
+        url: String,
+        publishableKey: String,
+        networkPolicy: LuxNetworkPolicy,
+        transport: any LuxTransport = URLSessionLuxTransport()
+    ) throws {
         var trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
         guard
@@ -37,7 +51,12 @@ public struct LuxClient: Sendable {
         }
         let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         let localHost = normalizedHost == "localhost" || normalizedHost == "127.0.0.1" || normalizedHost == "::1"
-        guard scheme == "https" || localHost else {
+        let localDevelopmentHost = Self.isLocalDevelopmentHost(normalizedHost)
+        guard
+            scheme == "https" ||
+            localHost ||
+            (networkPolicy == .localDevelopment && localDevelopmentHost)
+        else {
             throw LuxConfigurationError.insecureRemoteURL
         }
         guard
@@ -51,12 +70,57 @@ public struct LuxClient: Sendable {
         self.transport = transport
     }
 
-    public init(url: String, publishableKey: String, session: URLSession) throws {
+    public init(
+        url: String,
+        publishableKey: String,
+        session: URLSession
+    ) throws {
         try self.init(
             url: url,
             publishableKey: publishableKey,
+            networkPolicy: .secure,
+            session: session
+        )
+    }
+
+    public init(
+        url: String,
+        publishableKey: String,
+        networkPolicy: LuxNetworkPolicy,
+        session: URLSession
+    ) throws {
+        try self.init(
+            url: url,
+            publishableKey: publishableKey,
+            networkPolicy: networkPolicy,
             transport: URLSessionLuxTransport(session: session)
         )
+    }
+
+    private static func isLocalDevelopmentHost(_ host: String) -> Bool {
+        if host.hasSuffix(".local") || (!host.contains(".") && !host.contains(":")) {
+            return true
+        }
+
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+            .compactMap { Int($0) }
+        if octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) {
+            return octets[0] == 10 ||
+                (octets[0] == 172 && (16...31).contains(octets[1])) ||
+                (octets[0] == 192 && octets[1] == 168) ||
+                (octets[0] == 169 && octets[1] == 254)
+        }
+
+        guard host.contains(":"),
+              let firstHextet = host.split(separator: ":", omittingEmptySubsequences: false).first,
+              !firstHextet.isEmpty,
+              let value = UInt16(firstHextet, radix: 16)
+        else { return false }
+
+        // fc00::/7 is unique-local and fe80::/10 is link-local. Parsing the
+        // first hextet prevents public names such as `fd-example.com` from
+        // being mistaken for IPv6 addresses based on their prefix alone.
+        return (0xfc00...0xfdff).contains(value) || (0xfe80...0xfebf).contains(value)
     }
 
     // MARK: 1.0 auth transport compatibility
@@ -235,7 +299,7 @@ public struct LuxClient: Sendable {
         request.httpMethod = method.rawValue
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(publishableKey, forHTTPHeaderField: "apikey")
-        request.setValue("lux-swift/1.1", forHTTPHeaderField: "X-Lux-Client")
+        request.setValue("lux-swift/1.1.0", forHTTPHeaderField: "X-Lux-Client")
         if let bearerToken {
             request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         }
@@ -261,6 +325,17 @@ public struct LuxClient: Sendable {
         }
         return data
     }
+}
+
+/// Controls whether a Lux client may connect to cleartext local-development
+/// endpoints. HTTPS and loopback HTTP are always accepted.
+public enum LuxNetworkPolicy: Sendable, Equatable {
+    /// Require HTTPS for every non-loopback project URL.
+    case secure
+
+    /// Permit HTTP for private IPv4 ranges, link-local/unique-local IPv6, and
+    /// local hostnames. Use this only for a development engine on a trusted LAN.
+    case localDevelopment
 }
 
 enum LuxHTTPMethod: String, Sendable {

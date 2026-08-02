@@ -23,6 +23,27 @@ CLI-managed project, run `lux update engine` before adopting 1.1. For Lux
 Cloud, update the project from Project Settings or run
 `lux update engine <project>` after engine 0.37.0 is published.
 
+### Migrating from 1.0
+
+The 1.1 API is additive. Existing `LuxClient` and `LuxAuth` initializers remain
+source compatible, and the release gate compares the package against the
+`1.0.0` public API. Existing Keychain sessions continue using the same service
+and project-URL account, so no token migration is required.
+
+To adopt the new surface:
+
+1. Update the Lux engine to 0.37.0 or newer.
+2. Prefer one `LuxProject` over separately constructing the client and auth
+   objects; its `auth` namespace uses the same durable session format.
+3. Add the Push Notifications capability, forward the APNs delegate token to
+   `project.push.register(deviceToken:)`, and request permission from an
+   explicit user action.
+4. For a physical device talking to a cleartext LAN engine, opt into
+   `.localDevelopment`; remote URLs remain HTTPS-only.
+
+No database, realtime, storage, sending, or admin APIs are introduced by this
+upgrade.
+
 ## Create a project
 
 Create one `LuxProject` for the application:
@@ -48,10 +69,22 @@ struct ExampleApp: App {
 }
 ```
 
-Remote project URLs must use HTTPS. Plain HTTP is accepted only for
-`localhost`, `127.0.0.1`, and `::1`. The SDK rejects `lux_sec_` secret keys
-(and the legacy `lux_sk_` alias) so they cannot accidentally ship in a mobile
-application.
+Remote project URLs must use HTTPS. Plain HTTP is accepted automatically for
+`localhost`, `127.0.0.1`, and `::1`. A development app can explicitly opt into
+a private LAN engine without weakening public-host validation:
+
+```swift
+let lux = try LuxProject(
+    url: "http://192.168.1.50:15890",
+    publishableKey: "lux_pub_...",
+    networkPolicy: .localDevelopment
+)
+```
+
+`.localDevelopment` accepts private IPv4 ranges, local/unique-local IPv6, and
+local hostnames; it still rejects public cleartext endpoints. The SDK rejects
+`lux_sec_` secret keys (and the legacy `lux_sk_` alias) so they cannot
+accidentally ship in a mobile application.
 
 ## Authentication
 
@@ -78,6 +111,35 @@ The authorization code is therefore redeemable only by the SDK instance that
 started the native session, including when the callback uses a custom URL
 scheme.
 
+If the user dismisses the native Apple sheet or OAuth browser, the operation
+throws Swift's standard `CancellationError`. Treat that as a quiet cancellation
+rather than an authentication failure.
+
+Add the exact native callback (for example `myapp://auth/callback`) to the
+project's Auth redirect allow list in Studio or Cloud. Google, GitHub, and Apple
+developer consoles use the Lux engine's HTTPS provider callback shown by that
+provider configuration—not the app's custom URL. A local engine therefore needs
+a public HTTPS route only for the provider callback; the app can still talk to
+the engine directly over its trusted LAN address.
+
+Password recovery and verification links use the same durable session path:
+
+```swift
+try await lux.auth.resetPassword(
+    for: email,
+    redirectTo: URL(string: "myapp://auth/recovery")!
+)
+
+// Parse token_hash and type from the incoming application URL.
+try await lux.auth.verifyOTP(tokenHash: tokenHash, type: .recovery)
+try await lux.auth.updateUser(password: replacementPassword)
+```
+
+Use `updateUser(email:password:metadata:)` for authenticated profile changes,
+`getUser()` to revalidate the server user, and `accessToken()` when an app-owned
+backend needs the current bearer token. `accessToken()` refreshes automatically;
+applications should never read or persist refresh tokens themselves.
+
 `LuxAuth` is observable. `session`, `user`, and `isAuthenticated` update
 SwiftUI automatically. For non-view consumers, `auth.events()` is an
 `AsyncStream` of initial-session, sign-in, refresh, user-update, and sign-out
@@ -96,6 +158,12 @@ app, request permission:
 let status = try await lux.push.requestAuthorization()
 ```
 
+The default request asks for alerts, badges, and sounds. Advanced applications
+can additionally request provisional delivery, critical alerts, CarPlay, or an
+app-owned notification-settings screen with `LuxPushAuthorizationOptions`.
+Critical alerts and CarPlay still require the corresponding Apple entitlement;
+requesting an option does not grant that entitlement.
+
 Forward Apple's application-delegate token callback to Lux:
 
 ```swift
@@ -106,6 +174,23 @@ func application(
     Task { try await lux.push.register(deviceToken: deviceToken) }
 }
 ```
+
+After notification permission has already been granted, ask Apple for the
+current token on each launch without prompting again:
+
+```swift
+let status = await lux.push.refreshAuthorizationStatus()
+if status == .authorized || status == .provisional || status == .ephemeral {
+    lux.push.registerForRemoteNotifications()
+}
+```
+
+Apple may rotate the token between launches; every delegate callback should be
+forwarded to `register(deviceToken:)`, even when the value appears unchanged.
+
+Registration uses the application bundle identifier as `app_id` automatically,
+matching the APNs topic configured for the project. Pass `appID:` only when the
+project deliberately uses a different credential key.
 
 That is the only required callback. The SDK:
 
@@ -173,10 +258,16 @@ LUX_INTEGRATION_PUBLISHABLE_KEY=lux_pub_... \
 swift test --filter LuxIntegrationTests
 ```
 
+When the test engine is deliberately bound to a private LAN address, also set
+`LUX_INTEGRATION_LOCAL_DEVELOPMENT=true`. The harness otherwise keeps the
+SDK's secure network policy.
+
 Never log access tokens, refresh tokens, Apple identity tokens, APNs device
 tokens, nonces, or authorization headers.
 
 ## Release
 
 Tags use semantic versions. Pushing `1.1.0` runs the release workflow, tests the
-package, builds it for iOS Simulator, and creates the GitHub Release.
+package, builds it for iOS Simulator, verifies it against the minimum supported
+engine, and creates the GitHub Release. Follow [`RELEASING.md`](RELEASING.md)
+so the engine compatibility tag exists before the SDK tag is created.

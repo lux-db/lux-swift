@@ -153,7 +153,7 @@ public enum LuxPushAttachment {
             let destination = directory.appending(path: fileName)
             try FileManager.default.moveItem(at: temporaryURL, to: destination)
             let attachment = try UNNotificationAttachment(identifier: "lux-image", url: destination)
-            content.attachments = [attachment]
+            content.attachments.append(attachment)
         } catch {
             // Notification service extensions have strict execution budgets;
             // the original notification must still be delivered on any error.

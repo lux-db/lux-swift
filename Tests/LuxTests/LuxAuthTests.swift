@@ -1,9 +1,39 @@
+import AuthenticationServices
 import Foundation
 import Testing
 @testable import Lux
 
 @MainActor
 struct LuxAuthTests {
+    @Test func nativeAppleCancellationUsesStandardCancellationError() {
+        let error = NSError(
+            domain: ASAuthorizationError.errorDomain,
+            code: ASAuthorizationError.canceled.rawValue
+        )
+
+        #expect(normalizedAuthenticationError(error) is CancellationError)
+    }
+
+    @Test func browserOAuthCancellationUsesStandardCancellationError() {
+        let error = NSError(
+            domain: ASWebAuthenticationSessionError.errorDomain,
+            code: ASWebAuthenticationSessionError.canceledLogin.rawValue
+        )
+
+        #expect(normalizedAuthenticationError(error) is CancellationError)
+    }
+
+    @Test func authenticationErrorsPreserveNonCancellationFailures() {
+        let error = NSError(
+            domain: ASAuthorizationError.errorDomain,
+            code: ASAuthorizationError.failed.rawValue
+        )
+
+        let normalized = normalizedAuthenticationError(error) as NSError
+        #expect(normalized.domain == error.domain)
+        #expect(normalized.code == error.code)
+    }
+
     @Test func restoresSessionThroughInjectedStore() async throws {
         let stored = LuxStoredSession(
             session: Self.makeSession(accessToken: "persisted", expiresAt: 4_000),
@@ -313,6 +343,68 @@ struct LuxAuthTests {
             #expect(auth.session == nil)
             #expect(store.stored == nil)
         }
+    }
+
+    @Test func logoutRejectsOverlappingSignInDuringDependentCleanup() async throws {
+        let gate = SuspensionGate()
+        let transport = RecordingTransport { request, _ in
+            if request.url?.path == "/auth/v1/signin/anonymous" {
+                return (
+                    LuxClientTests.sessionData(accessToken: "unexpected-sign-in"),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            }
+            return (Data(), LuxClientTests.response(url: request.url!, status: 204))
+        }
+        let store = MemorySessionStore(LuxStoredSession(session: Self.makeSession()))
+        let auth = LuxAuth(client: Self.makeClient(transport: transport), sessionStore: store)
+        _ = try await auth.restoreSession()
+        _ = auth.addPreSignOutHandler { _ in await gate.suspend() }
+
+        let logout = Task { try await auth.signOut() }
+        await gate.waitUntilStarted()
+        #expect(auth.isSigningOut)
+        await #expect(throws: CancellationError.self) {
+            try await auth.signInAnonymously()
+        }
+        await gate.release()
+        try await logout.value
+
+        #expect(!auth.isSigningOut)
+        #expect(!auth.isAuthenticated)
+        #expect(store.stored == nil)
+        #expect(await transport.requests.map(\.url?.path) == ["/auth/v1/logout"])
+    }
+
+    @Test func logoutInvalidatesCancellationResistantGetUser() async throws {
+        let gate = SuspensionGate()
+        let transport = RecordingTransport { request, _ in
+            if request.url?.path == "/auth/v1/user" {
+                await gate.suspend()
+                return (
+                    Data(#"{"user":{"id":"user-1","email":"stale@example.test"}}"#.utf8),
+                    LuxClientTests.response(url: request.url!, status: 200)
+                )
+            }
+            return (Data(), LuxClientTests.response(url: request.url!, status: 204))
+        }
+        let auth = LuxAuth(
+            client: Self.makeClient(transport: transport),
+            sessionStore: MemorySessionStore(LuxStoredSession(session: Self.makeSession(
+                expiresAt: Int(Date().timeIntervalSince1970) + 3_600
+            )))
+        )
+        _ = try await auth.restoreSession()
+
+        let getUser = Task { try await auth.getUser() }
+        await gate.waitUntilStarted()
+        let logout = Task { try await auth.signOut() }
+        await Task.yield()
+        await gate.release()
+
+        await #expect(throws: CancellationError.self) { try await getUser.value }
+        try await logout.value
+        #expect(!auth.isAuthenticated)
     }
 
     private static func makeClient(transport: any LuxTransport) -> LuxClient {
