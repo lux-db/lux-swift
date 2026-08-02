@@ -4,6 +4,46 @@ import Testing
 
 @MainActor
 struct LuxIntegrationTests {
+    @Test func passwordSessionLifecycleAgainstEngine() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard
+            let url = environment["LUX_INTEGRATION_URL"],
+            let key = environment["LUX_INTEGRATION_PUBLISHABLE_KEY"]
+        else { return }
+
+        let client = try Self.client(url: url, key: key, environment: environment)
+        let auth = LuxAuth(client: client, sessionStore: MemorySessionStore())
+        let identity = UUID().uuidString.lowercased()
+        let email = "swift-\(identity)@example.test"
+        let password = "lux-integration-\(identity)"
+
+        let signup = try await auth.signUp(
+            email: email,
+            password: password,
+            metadata: ["source": .string("lux-swift-integration")]
+        )
+        #expect(signup.session != nil)
+        #expect(signup.user.email == email)
+
+        try await auth.signOut()
+        #expect(!auth.isAuthenticated)
+
+        let passwordSession = try await auth.signInWithPassword(email: email, password: password)
+        #expect(passwordSession.user.email == email)
+        #expect(try await auth.getUser().id == passwordSession.user.id)
+
+        let updated = try await auth.updateUser(metadata: ["verified": .bool(true)])
+        #expect(updated.userMetadata?["verified"] == .bool(true))
+
+        let refreshed = try await auth.refreshSession()
+        #expect(refreshed.user.id == passwordSession.user.id)
+        #expect(refreshed.refreshToken != passwordSession.refreshToken)
+
+        try await auth.signOut()
+        #expect(!auth.isAuthenticated)
+        await #expect(throws: LuxError.self) { try await auth.accessToken() }
+    }
+
     /// Opt-in contract test against a real Lux engine. CI or local development
     /// supplies an isolated project URL and publishable key.
     @Test func anonymousAuthAndSelfPushRegistrationAgainstEngine() async throws {
@@ -13,7 +53,7 @@ struct LuxIntegrationTests {
             let key = environment["LUX_INTEGRATION_PUBLISHABLE_KEY"]
         else { return }
 
-        let client = try LuxClient(url: url, publishableKey: key)
+        let client = try Self.client(url: url, key: key, environment: environment)
         let auth = LuxAuth(client: client, sessionStore: MemorySessionStore())
         let push = LuxPush(
             client: client,
@@ -39,5 +79,16 @@ struct LuxIntegrationTests {
         #expect(push.registration?.deviceID == nil)
         try await auth.signOut()
         #expect(auth.session == nil)
+    }
+
+    private static func client(
+        url: String,
+        key: String,
+        environment: [String: String]
+    ) throws -> LuxClient {
+        let policy: LuxNetworkPolicy = environment["LUX_INTEGRATION_LOCAL_DEVELOPMENT"] == "true"
+            ? .localDevelopment
+            : .secure
+        return try LuxClient(url: url, publishableKey: key, networkPolicy: policy)
     }
 }
