@@ -1,9 +1,39 @@
+import AuthenticationServices
 import Foundation
 import Testing
 @testable import Lux
 
 @MainActor
 struct LuxAuthTests {
+    @Test func nativeAppleCancellationUsesStandardCancellationError() {
+        let error = NSError(
+            domain: ASAuthorizationError.errorDomain,
+            code: ASAuthorizationError.canceled.rawValue
+        )
+
+        #expect(normalizedAuthenticationError(error) is CancellationError)
+    }
+
+    @Test func browserOAuthCancellationUsesStandardCancellationError() {
+        let error = NSError(
+            domain: ASWebAuthenticationSessionError.errorDomain,
+            code: ASWebAuthenticationSessionError.canceledLogin.rawValue
+        )
+
+        #expect(normalizedAuthenticationError(error) is CancellationError)
+    }
+
+    @Test func authenticationErrorsPreserveNonCancellationFailures() {
+        let error = NSError(
+            domain: ASAuthorizationError.errorDomain,
+            code: ASAuthorizationError.failed.rawValue
+        )
+
+        let normalized = normalizedAuthenticationError(error) as NSError
+        #expect(normalized.domain == error.domain)
+        #expect(normalized.code == error.code)
+    }
+
     @Test func restoresSessionThroughInjectedStore() async throws {
         let stored = LuxStoredSession(
             session: Self.makeSession(accessToken: "persisted", expiresAt: 4_000),

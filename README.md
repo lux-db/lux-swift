@@ -111,6 +111,10 @@ The authorization code is therefore redeemable only by the SDK instance that
 started the native session, including when the callback uses a custom URL
 scheme.
 
+If the user dismisses the native Apple sheet or OAuth browser, the operation
+throws Swift's standard `CancellationError`. Treat that as a quiet cancellation
+rather than an authentication failure.
+
 Add the exact native callback (for example `myapp://auth/callback`) to the
 project's Auth redirect allow list in Studio or Cloud. Google, GitHub, and Apple
 developer consoles use the Lux engine's HTTPS provider callback shown by that

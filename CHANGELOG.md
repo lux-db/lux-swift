@@ -21,6 +21,8 @@ Auth + Push SDK for Lux engine 0.37.0 and newer.
 - An explicit local-development network policy for private LAN engines while
   preserving HTTPS-by-default behavior for remote projects.
 - A complete SwiftUI/Auth/Push sample and opt-in real-engine contract tests.
+- Native Apple and browser OAuth dismissal surfaces as Swift's standard
+  `CancellationError`, so apps can distinguish user cancellation from failure.
 
 ### Security
 

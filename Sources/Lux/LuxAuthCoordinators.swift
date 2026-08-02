@@ -7,6 +7,15 @@ import UIKit
 import AppKit
 #endif
 
+func normalizedAuthenticationError(_ error: Error) -> Error {
+    let nsError = error as NSError
+    let isAppleCancellation = nsError.domain == ASAuthorizationError.errorDomain
+        && nsError.code == ASAuthorizationError.canceled.rawValue
+    let isWebCancellation = nsError.domain == ASWebAuthenticationSessionError.errorDomain
+        && nsError.code == ASWebAuthenticationSessionError.canceledLogin.rawValue
+    return isAppleCancellation || isWebCancellation ? CancellationError() : error
+}
+
 @MainActor
 final class AppleSignInCoordinator: NSObject,
     ASAuthorizationControllerDelegate,
@@ -52,7 +61,7 @@ final class AppleSignInCoordinator: NSObject,
     }
 
     func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
-        finish(.failure(error))
+        finish(.failure(normalizedAuthenticationError(error)))
     }
 
     func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
@@ -100,7 +109,7 @@ final class OAuthWebCoordinator: NSObject, ASWebAuthenticationPresentationContex
                 ) { [weak self] url, error in
                     self?.session = nil
                     self?.presentationAnchor = nil
-                    if let error { continuation.resume(throwing: error) }
+                    if let error { continuation.resume(throwing: normalizedAuthenticationError(error)) }
                     else if let url { continuation.resume(returning: url) }
                     else { continuation.resume(throwing: LuxError(code: "OAUTH_EMPTY_CALLBACK", message: "OAuth returned no callback URL")) }
                 }

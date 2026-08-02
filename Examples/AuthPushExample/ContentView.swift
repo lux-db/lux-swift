@@ -88,6 +88,8 @@ struct ContentView: View {
             do {
                 try await operation()
                 errorMessage = nil
+            } catch is CancellationError {
+                errorMessage = nil
             } catch {
                 errorMessage = error.localizedDescription
             }
