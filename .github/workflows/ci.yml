@@ -59,9 +59,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: lux-db/lux
-          # Immutable stacked engine revision; replace with its release tag
-          # before marking the 1.1.0 SDK release PR ready.
-          ref: 51801966d8ba587dcc3fa12c88a59c2f773aa046
+          # Immutable engine release required by the 1.1.0 SDK contracts.
+          ref: v0.37.0
           path: .integration/lux
       - name: Build released Lux engine
         working-directory: .integration/lux
