@@ -8,7 +8,10 @@ Lux project.
 Create one ``LuxProject`` and place it in the SwiftUI environment. Its
 ``LuxProject/auth`` namespace owns durable session state; its
 ``LuxProject/push`` namespace owns the current APNs token and binds it to the
-authenticated user.
+authenticated user. After permission is granted, call
+``LuxPush/registerForRemoteNotifications()`` on each launch and forward every
+Apple token callback to ``LuxPush/register(deviceToken:appID:)`` so token
+rotation remains synchronized.
 
 The package deliberately exposes no database, realtime, storage, notification
 sending, or secret-key administration APIs.
@@ -19,6 +22,7 @@ sending, or secret-key administration APIs.
 
 - ``LuxProject``
 - ``LuxClient``
+- ``LuxNetworkPolicy``
 
 ### Authentication
 
@@ -27,8 +31,13 @@ sending, or secret-key administration APIs.
 - ``LuxUser``
 - ``LuxAuthEvent``
 - ``LuxOAuthProvider``
+- ``LuxOAuthFlow``
 - ``LuxAuthResult``
 - ``LuxOTPType``
+- ``LuxJSONValue``
+- ``LuxAppleCredentialState``
+- ``LuxAppleCredentialStateProviding``
+- ``SystemAppleCredentialStateProvider``
 
 ### Push notifications
 
@@ -42,3 +51,29 @@ sending, or secret-key administration APIs.
 - ``LuxPushSound``
 - ``LuxPushInterruptionLevel``
 - ``LuxPushAttachment``
+
+### Testing and configuration
+
+- ``LuxTransport``
+- ``LuxSessionStore``
+- ``LuxStoredSession``
+- ``KeychainLuxSessionStore``
+- ``LuxPushRegistrationStore``
+- ``LuxStoredPushRegistration``
+- ``KeychainLuxPushRegistrationStore``
+- ``LuxPushSystemProviding``
+- ``SystemLuxPushProvider``
+- ``LuxAPNSEnvironmentProviding``
+- ``SystemLuxAPNSEnvironmentProvider``
+
+### Errors
+
+- ``LuxError``
+- ``LuxAPIError``
+- ``LuxConfigurationError``
+- ``LuxSecurityError``
+- ``LuxEncodingError``
+- ``LuxResponseError``
+- ``LuxSessionPersistenceError``
+- ``LuxSessionStoreError``
+- ``LuxPushStoreError``

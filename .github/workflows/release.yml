@@ -13,6 +13,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Validate tag
         run: |
           if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -21,6 +23,8 @@ jobs:
           fi
       - name: Test
         run: swift test
+      - name: Preserve the 1.0 public API
+        run: swift package diagnose-api-breaking-changes 1.0.0
       - name: Build iOS package
         run: |
           xcodebuild build \

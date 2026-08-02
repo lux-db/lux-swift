@@ -14,10 +14,16 @@ public final class LuxProject {
     public init(
         url: String,
         publishableKey: String,
+        networkPolicy: LuxNetworkPolicy = .secure,
         session: URLSession = .shared,
         presentationAnchor: @escaping () -> ASPresentationAnchor? = { nil }
     ) throws {
-        let client = try LuxClient(url: url, publishableKey: publishableKey, session: session)
+        let client = try LuxClient(
+            url: url,
+            publishableKey: publishableKey,
+            networkPolicy: networkPolicy,
+            session: session
+        )
         let auth = LuxAuth(client: client, presentationAnchor: presentationAnchor)
         self.client = client
         self.auth = auth

@@ -31,6 +31,8 @@ public struct LuxPushAuthorizationOptions: OptionSet, Sendable {
     public static let sound = Self(rawValue: 1 << 2)
     public static let provisional = Self(rawValue: 1 << 3)
     public static let criticalAlert = Self(rawValue: 1 << 4)
+    public static let carPlay = Self(rawValue: 1 << 5)
+    public static let providesAppNotificationSettings = Self(rawValue: 1 << 6)
     public static let standard: Self = [.alert, .badge, .sound]
 
     var native: UNAuthorizationOptions {
@@ -40,6 +42,10 @@ public struct LuxPushAuthorizationOptions: OptionSet, Sendable {
         if contains(.sound) { options.insert(.sound) }
         if contains(.provisional) { options.insert(.provisional) }
         if contains(.criticalAlert) { options.insert(.criticalAlert) }
+        if contains(.carPlay) { options.insert(.carPlay) }
+        if contains(.providesAppNotificationSettings) {
+            options.insert(.providesAppNotificationSettings)
+        }
         return options
     }
 }
@@ -150,7 +156,8 @@ public final class LuxPush {
     private var synchronizationTaskGeneration: UInt64?
     @ObservationIgnored
     private nonisolated(unsafe) var authEventsTask: Task<Void, Never>?
-    private var preSignOutHandlerID: UUID?
+    @ObservationIgnored
+    private nonisolated(unsafe) var preSignOutHandlerID: UUID?
     private var isSigningOut = false
 
     public convenience init(client: LuxClient, auth: LuxAuth) {
@@ -229,6 +236,12 @@ public final class LuxPush {
     deinit {
         authEventsTask?.cancel()
         synchronizationTask?.cancel()
+        if let preSignOutHandlerID {
+            let auth = self.auth
+            Task { @MainActor in
+                auth.removePreSignOutHandler(preSignOutHandlerID)
+            }
+        }
     }
 
     @discardableResult
@@ -254,9 +267,16 @@ public final class LuxPush {
         return status
     }
 
+    /// Ask Apple to deliver the current APNs token through the application
+    /// delegate without presenting a permission prompt. Call this on launches
+    /// after the user has enabled notifications so token rotation is observed.
+    public func registerForRemoteNotifications() {
+        system.registerForRemoteNotifications()
+    }
+
     /// Persist the APNs token immediately. If no user is signed in it remains
     /// pending and is registered automatically after the next authentication.
-    public func register(deviceToken: Data, appID: String = "default") async throws {
+    public func register(deviceToken: Data, appID: String? = nil) async throws {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
         try await register(
             token: token,
@@ -268,10 +288,14 @@ public final class LuxPush {
     public func register(
         token: String,
         environment: LuxAPNSEnvironment = .unspecified,
-        appID: String = "default"
+        appID: String? = nil
     ) async throws {
         guard !token.isEmpty else {
             throw LuxError(code: "PUSH_EMPTY_TOKEN", message: "APNs returned an empty device token")
+        }
+        let resolvedAppID = appID ?? Bundle.main.bundleIdentifier ?? "default"
+        guard !resolvedAppID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LuxError(code: "PUSH_EMPTY_APP_ID", message: "APNs registration requires an app identifier")
         }
         let existing = registration
         let sameToken = existing?.token == token
@@ -283,7 +307,7 @@ public final class LuxPush {
         let pending = LuxStoredPushRegistration(
             token: token,
             environment: environment,
-            appID: appID,
+            appID: resolvedAppID,
             deviceID: sameToken ? existing?.deviceID : nil,
             userID: sameToken ? existing?.userID : nil,
             pendingRemovalTokens: pendingRemovalTokens
@@ -343,7 +367,7 @@ public final class LuxPush {
             path: "/push/devices",
             body: RegisterDeviceBody(
                 token: pending.token,
-                platform: "ios",
+                platform: Self.nativePlatform,
                 appID: pending.appID,
                 environment: pending.environment.rawValue
             ),
@@ -475,6 +499,16 @@ public final class LuxPush {
             registration == expected,
             auth.user?.id == userID
         else { throw CancellationError() }
+    }
+
+    private static var nativePlatform: String {
+        #if os(iOS)
+        "ios"
+        #elseif os(macOS)
+        "macos"
+        #else
+        "apple"
+        #endif
     }
 }
 

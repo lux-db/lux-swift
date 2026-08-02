@@ -101,8 +101,52 @@ struct LuxClientTests {
         _ = try LuxClient(url: "http://127.0.0.1:5890", publishableKey: "public-key")
         _ = try LuxClient(url: "http://[::1]:5890", publishableKey: "public-key")
 
+        for url in [
+            "http://10.0.0.144:15890",
+            "http://172.16.0.1:15890",
+            "http://172.31.255.254:15890",
+            "http://192.168.64.1:15890",
+            "http://169.254.1.1:15890",
+            "http://engine.local:15890",
+            "http://lux-engine:15890",
+            "http://[fd00::1]:15890",
+            "http://[fe80::1]:15890",
+        ] {
+            _ = try LuxClient(
+                url: url,
+                publishableKey: "public-key",
+                networkPolicy: .localDevelopment
+            )
+        }
+
         #expect(throws: LuxConfigurationError.insecureRemoteURL) {
             try LuxClient(url: "http://example.com", publishableKey: "public-key")
+        }
+        #expect(throws: LuxConfigurationError.insecureRemoteURL) {
+            try LuxClient(url: "http://10.0.0.144:15890", publishableKey: "public-key")
+        }
+        #expect(throws: LuxConfigurationError.insecureRemoteURL) {
+            try LuxClient(
+                url: "http://8.8.8.8:15890",
+                publishableKey: "public-key",
+                networkPolicy: .localDevelopment
+            )
+        }
+        #expect(throws: LuxConfigurationError.insecureRemoteURL) {
+            try LuxClient(
+                url: "http://172.32.0.1:15890",
+                publishableKey: "public-key",
+                networkPolicy: .localDevelopment
+            )
+        }
+        for deceptiveHost in ["fc-example.com", "fd.example.com", "fe80.example.com"] {
+            #expect(throws: LuxConfigurationError.insecureRemoteURL) {
+                try LuxClient(
+                    url: "http://\(deceptiveHost)",
+                    publishableKey: "public-key",
+                    networkPolicy: .localDevelopment
+                )
+            }
         }
         #expect(throws: LuxConfigurationError.userInfoNotAllowed) {
             try LuxClient(url: "https://user@example.com", publishableKey: "public-key")
@@ -119,6 +163,13 @@ struct LuxClientTests {
         #expect(throws: LuxConfigurationError.invalidURL) {
             try LuxClient(url: "not a url", publishableKey: "public-key")
         }
+    }
+
+    @Test func publicErrorsHaveUsefulLocalizedDescriptions() {
+        #expect(LuxError(code: "NO_SESSION", message: "No authenticated session").localizedDescription == "No authenticated session")
+        #expect(LuxAPIError(statusCode: 401, message: "Session expired").localizedDescription == "Session expired")
+        #expect(LuxSecurityError.secretKeyNotAllowed.localizedDescription.contains("publishable key"))
+        #expect(LuxConfigurationError.insecureRemoteURL.localizedDescription.contains("HTTPS"))
     }
 
     static func sessionData(accessToken: String, expiresIn: Int = 3600) -> Data {

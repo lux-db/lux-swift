@@ -76,6 +76,12 @@ struct LuxPushTests {
         let json = try #require(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: String])
         #expect(json["token"] == "000fa0ff")
         #expect(json["environment"] == "production")
+        #expect(json["app_id"] == (Bundle.main.bundleIdentifier ?? "default"))
+        #if os(iOS)
+        #expect(json["platform"] == "ios")
+        #elseif os(macOS)
+        #expect(json["platform"] == "macos")
+        #endif
     }
 
     @Test func signOutDeletesDeviceBeforeRevokingSessionAndLeavesTokenPending() async throws {
@@ -401,11 +407,82 @@ struct LuxPushTests {
             environmentProvider: FixedEnvironmentProvider(environment: .sandbox)
         )
 
-        let status = try await push.requestAuthorization()
+        let requested: LuxPushAuthorizationOptions = [
+            .alert,
+            .badge,
+            .sound,
+            .provisional,
+            .criticalAlert,
+            .carPlay,
+            .providesAppNotificationSettings,
+        ]
+        let status = try await push.requestAuthorization(requested)
 
         #expect(status == .authorized)
         #expect(system.requestCount == 1)
+        #expect(system.requestedOptions == requested)
         #expect(system.registrationCount == 1)
+    }
+
+    @Test func authorizationOptionsMapToNativeFlags() {
+        let options: LuxPushAuthorizationOptions = [
+            .alert,
+            .badge,
+            .sound,
+            .provisional,
+            .criticalAlert,
+            .carPlay,
+            .providesAppNotificationSettings,
+        ]
+
+        #expect(options.native == [
+            .alert,
+            .badge,
+            .sound,
+            .provisional,
+            .criticalAlert,
+            .carPlay,
+            .providesAppNotificationSettings,
+        ])
+    }
+
+    @Test func launchTimeRegistrationRefreshDoesNotRequestPermission() {
+        let system = FixedPushSystem(status: .authorized, grant: true)
+        let client = Self.client(RecordingTransport { request, _ in
+            (Data(), LuxClientTests.response(url: request.url!, status: 204))
+        })
+        let push = LuxPush(
+            client: client,
+            auth: LuxAuth(client: client, sessionStore: MemorySessionStore()),
+            store: MemoryPushStore(),
+            system: system,
+            environmentProvider: FixedEnvironmentProvider(environment: .sandbox)
+        )
+
+        push.registerForRemoteNotifications()
+
+        #expect(system.registrationCount == 1)
+        #expect(system.requestCount == 0)
+    }
+
+    @Test func rejectsEmptyTokenAndExplicitAppIdentifier() async throws {
+        let client = Self.client(RecordingTransport { request, _ in
+            (Data(), LuxClientTests.response(url: request.url!, status: 204))
+        })
+        let push = LuxPush(
+            client: client,
+            auth: LuxAuth(client: client, sessionStore: MemorySessionStore()),
+            store: MemoryPushStore(),
+            system: FixedPushSystem(),
+            environmentProvider: FixedEnvironmentProvider(environment: .sandbox)
+        )
+
+        await #expect(throws: LuxError.self) {
+            try await push.register(token: "")
+        }
+        await #expect(throws: LuxError.self) {
+            try await push.register(token: "aabb", appID: "  ")
+        }
     }
 
     @Test func decodesLuxPayloadWithoutLeakingReservedEnvelope() {
@@ -417,6 +494,11 @@ struct LuxPushTests {
                     "body": "World",
                     "title-loc-key": "MESSAGE_TITLE",
                     "title-loc-args": ["Alice"],
+                    "subtitle-loc-key": "MESSAGE_SUBTITLE",
+                    "subtitle-loc-args": ["Engineering"],
+                    "loc-key": "MESSAGE_BODY",
+                    "loc-args": ["Build passed"],
+                    "launch-image": "LaunchMessage",
                 ],
                 "badge": 3,
                 "category": "MESSAGE",
@@ -425,6 +507,7 @@ struct LuxPushTests {
                 "interruption-level": "time-sensitive",
                 "relevance-score": 0.9,
                 "target-content-id": "message-1",
+                "filter-criteria": "work",
                 "content-available": 1,
                 "mutable-content": 1,
             ],
@@ -439,7 +522,12 @@ struct LuxPushTests {
             subtitle: "Team",
             body: "World",
             titleLocalizationKey: "MESSAGE_TITLE",
-            titleLocalizationArguments: ["Alice"]
+            titleLocalizationArguments: ["Alice"],
+            subtitleLocalizationKey: "MESSAGE_SUBTITLE",
+            subtitleLocalizationArguments: ["Engineering"],
+            bodyLocalizationKey: "MESSAGE_BODY",
+            bodyLocalizationArguments: ["Build passed"],
+            launchImage: "LaunchMessage"
         ))
         #expect(payload.badge == 3)
         #expect(payload.threadID == "room-1")
@@ -449,6 +537,7 @@ struct LuxPushTests {
         #expect(payload.interruptionLevel == .timeSensitive)
         #expect(payload.relevanceScore == 0.9)
         #expect(payload.targetContentID == "message-1")
+        #expect(payload.filterCriteria == "work")
         #expect(payload.contentAvailable)
         #expect(payload.mutableContent)
         #expect(payload.imageURL?.absoluteString == "https://example.com/image.jpg")
@@ -637,6 +726,7 @@ final class FixedPushSystem: LuxPushSystemProviding {
     let grant: Bool
     private(set) var requestCount = 0
     private(set) var registrationCount = 0
+    private(set) var requestedOptions: LuxPushAuthorizationOptions?
 
     init(status: LuxPushAuthorizationStatus = .notDetermined, grant: Bool = false) {
         self.status = status
@@ -646,6 +736,7 @@ final class FixedPushSystem: LuxPushSystemProviding {
     func authorizationStatus() async -> LuxPushAuthorizationStatus { status }
     func requestAuthorization(options: LuxPushAuthorizationOptions) async throws -> Bool {
         requestCount += 1
+        requestedOptions = options
         return grant
     }
     func registerForRemoteNotifications() { registrationCount += 1 }

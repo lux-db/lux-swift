@@ -18,7 +18,15 @@ struct AuthPushExampleApp: App {
                         try await lux.push.register(deviceToken: token)
                     }
                     _ = try? await lux.auth.restoreSession()
-                    _ = await lux.push.refreshAuthorizationStatus()
+                    let status = await lux.push.refreshAuthorizationStatus()
+                    switch status {
+                    case .authorized, .provisional, .ephemeral:
+                        // Apple can rotate the token between launches. This
+                        // does not present another permission prompt.
+                        lux.push.registerForRemoteNotifications()
+                    case .notDetermined, .denied:
+                        break
+                    }
                 }
         }
     }
