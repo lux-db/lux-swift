@@ -1,9 +1,24 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact Swift package version to publish
+        required: true
+        type: string
+      source_sha:
+        description: Approved Lux Swift commit
+        required: true
+        type: string
+      lux_source_sha:
+        description: Approved Lux Engine commit
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful lux-db/lux release-candidate run
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,16 +26,65 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    environment: production-release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
       - name: Validate tag
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Tag must use semantic versioning, for example 1.0.0"
             exit 1
           fi
+          test "$SOURCE_SHA" = "$(git rev-parse HEAD)"
+          git fetch --no-tags origin main
+          test "$SOURCE_SHA" = "$(git rev-parse FETCH_HEAD)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null; then
+            echo "Tag $VERSION already exists"
+            exit 1
+          fi
+      - name: Verify the approved Lux release candidate
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GH_TOKEN: ${{ secrets.LUX_RELEASE_READ_TOKEN }}
+          LUX_SOURCE_SHA: ${{ inputs.lux_source_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          test -n "$GH_TOKEN"
+          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$LUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          gh api "repos/lux-db/lux/actions/runs/$CANDIDATE_RUN_ID" > "$RUNNER_TEMP/lux-candidate-run.json"
+          jq -e \
+            --arg sha "$LUX_SOURCE_SHA" \
+            '.head_sha == $sha and .head_branch == "main" and .conclusion == "success" and .path == ".github/workflows/release.yml"' \
+            "$RUNNER_TEMP/lux-candidate-run.json"
+          mkdir -p "$RUNNER_TEMP/lux-candidate"
+          gh run download "$CANDIDATE_RUN_ID" \
+            --repo lux-db/lux \
+            --name "release-candidate-$LUX_SOURCE_SHA" \
+            --dir "$RUNNER_TEMP/lux-candidate"
+          (cd "$RUNNER_TEMP/lux-candidate" && shasum --algorithm 256 --check SHA256SUMS)
+          for artifact in "$RUNNER_TEMP/lux-candidate"/*; do
+            gh attestation verify "$artifact" \
+              --repo lux-db/lux \
+              --signer-workflow lux-db/lux/.github/workflows/release.yml \
+              --source-digest "$LUX_SOURCE_SHA" \
+              --deny-self-hosted-runners
+          done
+          jq -e \
+            --arg run "$CANDIDATE_RUN_ID" \
+            --arg lux_sha "$LUX_SOURCE_SHA" \
+            --arg swift_sha "$SOURCE_SHA" \
+            --arg version "$VERSION" \
+            '.channel == "stable" and .source.branch == "main" and .workflow.run_id == $run and .source.sha == $lux_sha and .components.swift.sha == $swift_sha and .components.swift.version == $version' \
+            "$RUNNER_TEMP/lux-candidate/release-manifest.json"
       - name: Test
         run: swift test
       - name: Preserve the 1.0 public API
@@ -51,20 +115,21 @@ jobs:
             -target arm64-apple-ios17.0-simulator \
             -I "$RUNNER_TEMP/lux-derived/Build/Products/Debug-iphonesimulator" \
             Examples/AuthPushExample/NotificationService.swift
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: lux-db/lux
-          ref: v0.37.0
+          ref: ${{ inputs.lux_source_sha }}
           path: .integration/lux
-      - name: Build minimum supported Lux engine
+      - name: Build approved Lux engine
         working-directory: .integration/lux
         run: cargo build --locked --bin lux
-      - name: Test Auth and Push against engine 0.37.0
+      - name: Test Auth and Push against the approved engine
         env:
           LUX_AUTH_ENABLED: "true"
           LUX_AUTH_PUBLISHABLE_KEY: lux_pub_swift_release
           LUX_AUTH_SECRET_KEY: lux_sec_swift_release
           LUX_DATA_DIR: ${{ runner.temp }}/lux-swift-engine
+          LUX_ENC_AUTO_INIT: "1"
           LUX_HTTP_PORT: "5899"
           LUX_PORT: "6399"
           LUX_SAVE_INTERVAL: "0"
@@ -98,4 +163,6 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        run: gh release create "$VERSION" --target "$SOURCE_SHA" --generate-notes
