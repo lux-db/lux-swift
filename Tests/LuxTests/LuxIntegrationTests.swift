@@ -4,12 +4,12 @@ import Testing
 
 @MainActor
 struct LuxIntegrationTests {
-    @Test func passwordSessionLifecycleAgainstEngine() async throws {
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["LUX_INTEGRATION_URL"] != nil,
+                   "Set LUX_INTEGRATION_URL to run against an isolated Engine"))
+    func passwordSessionLifecycleAgainstEngine() async throws {
         let environment = ProcessInfo.processInfo.environment
-        guard
-            let url = environment["LUX_INTEGRATION_URL"],
-            let key = environment["LUX_INTEGRATION_PUBLISHABLE_KEY"]
-        else { return }
+        let url = try #require(environment["LUX_INTEGRATION_URL"])
+        let key = try #require(environment["LUX_INTEGRATION_PUBLISHABLE_KEY"])
 
         let client = try Self.client(url: url, key: key, environment: environment)
         let auth = LuxAuth(client: client, sessionStore: MemorySessionStore())
@@ -46,12 +46,12 @@ struct LuxIntegrationTests {
 
     /// Opt-in contract test against a real Lux engine. CI or local development
     /// supplies an isolated project URL and publishable key.
-    @Test func anonymousAuthAndSelfPushRegistrationAgainstEngine() async throws {
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["LUX_INTEGRATION_URL"] != nil,
+                   "Set LUX_INTEGRATION_URL to run against an isolated Engine"))
+    func anonymousAuthAndSelfPushRegistrationAgainstEngine() async throws {
         let environment = ProcessInfo.processInfo.environment
-        guard
-            let url = environment["LUX_INTEGRATION_URL"],
-            let key = environment["LUX_INTEGRATION_PUBLISHABLE_KEY"]
-        else { return }
+        let url = try #require(environment["LUX_INTEGRATION_URL"])
+        let key = try #require(environment["LUX_INTEGRATION_PUBLISHABLE_KEY"])
 
         let client = try Self.client(url: url, key: key, environment: environment)
         let auth = LuxAuth(client: client, sessionStore: MemorySessionStore())

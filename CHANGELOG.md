@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Default HTTP transport now bounds request inactivity to 30 seconds and the
+  complete resource transfer to 60 seconds. Custom URLSession settings remain supported.
+- Cancelled client tasks do not accept results from custom transports that finish late.
+
+- Fix macOS APNs device registration using the engine's existing `ios` transport
+  value rather than the unsupported `macos` platform value. iOS behavior is unchanged.
+
 ## 1.1.0
 
 Lux Swift 1.1 turns the original Sign in with Apple package into the native

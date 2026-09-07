@@ -77,11 +77,7 @@ struct LuxPushTests {
         #expect(json["token"] == "000fa0ff")
         #expect(json["environment"] == "production")
         #expect(json["app_id"] == (Bundle.main.bundleIdentifier ?? "default"))
-        #if os(iOS)
         #expect(json["platform"] == "ios")
-        #elseif os(macOS)
-        #expect(json["platform"] == "macos")
-        #endif
     }
 
     @Test func signOutDeletesDeviceBeforeRevokingSessionAndLeavesTokenPending() async throws {

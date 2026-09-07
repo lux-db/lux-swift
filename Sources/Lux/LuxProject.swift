@@ -15,7 +15,7 @@ public final class LuxProject {
         url: String,
         publishableKey: String,
         networkPolicy: LuxNetworkPolicy = .secure,
-        session: URLSession = .shared,
+        session: URLSession = URLSessionLuxTransport.defaultSession,
         presentationAnchor: @escaping () -> ASPresentationAnchor? = { nil }
     ) throws {
         let client = try LuxClient(
