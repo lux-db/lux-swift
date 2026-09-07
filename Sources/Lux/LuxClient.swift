@@ -311,7 +311,9 @@ public struct LuxClient: Sendable {
     }
 
     private func send(_ request: URLRequest) async throws -> Data {
+        try Task.checkCancellation()
         let (data, response) = try await transport.data(for: request)
+        try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse else {
             throw LuxResponseError.nonHTTPResponse
         }

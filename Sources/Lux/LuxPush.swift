@@ -367,7 +367,8 @@ public final class LuxPush {
             path: "/push/devices",
             body: RegisterDeviceBody(
                 token: pending.token,
-                platform: Self.nativePlatform,
+                // The engine's `ios` wire value selects APNs on all Apple platforms.
+                platform: "ios",
                 appID: pending.appID,
                 environment: pending.environment.rawValue
             ),
@@ -501,15 +502,6 @@ public final class LuxPush {
         else { throw CancellationError() }
     }
 
-    private static var nativePlatform: String {
-        #if os(iOS)
-        "ios"
-        #elseif os(macOS)
-        "macos"
-        #else
-        "apple"
-        #endif
-    }
 }
 
 private struct RegisterDeviceBody: Encodable {

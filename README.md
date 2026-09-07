@@ -16,12 +16,26 @@ select the `1.1.0` release.
 
 ## Compatibility
 
-Lux Swift 1.1 requires Lux engine 0.37.0 or newer. That engine release binds
+The default HTTP transport uses a 30-second request-inactivity timeout and a
+60-second complete-resource timeout. Supply a configured `URLSession` to
+`LuxProject` or `LuxClient` when your application needs different settings.
+Cancelling the calling Swift task cancels the default URLSession request.
+Writes are not automatically replayed after a connection failure.
+
+Local integration tests are opt-in. With a disposable auth-enabled Engine,
+set `LUX_INTEGRATION_URL`, `LUX_INTEGRATION_PUBLISHABLE_KEY`, and (for LAN HTTP)
+`LUX_INTEGRATION_LOCAL_DEVELOPMENT=true`, then run `swift test --jobs 1`.
+Without a URL, integration cases are explicitly skipped; an incomplete test
+configuration fails instead of reporting a successful check.
+
+Lux Swift 1.1 supports Lux engine 0.37.0 and the Engine 1.x contract. Engine
+major-version compatibility is assessed separately; incompatible public SDK
+API changes require an SDK major release. Engine 0.37.0 binds
 native OAuth authorization codes with PKCE and allows authenticated apps to
 remove only their own APNs tokens during rotation and sign-out. For a local
 CLI-managed project, run `lux update engine` before adopting 1.1. For Lux
 Cloud, update the project from Project Settings or run
-`lux update engine <project>` after engine 0.37.0 is published.
+`lux update engine <project>`.
 
 ### Migrating from 1.0
 
